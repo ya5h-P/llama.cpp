@@ -620,6 +620,13 @@ static __global__ void mul_mat_vec_q(
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
+    // -1 id: the expert is computed elsewhere, write zeros
+    const bool skip_id = ncols_dst == 1 && ids && int32_t(channel_x) < 0;
+    if (skip_id) {
+        channel_x = 0;
+    }
+    const int blocks_per_row_x_used = skip_id ? 0 : blocks_per_row_x;
+
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
@@ -696,7 +703,7 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x_used; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
         // x block quant index when casting the quants to int
@@ -815,7 +822,7 @@ static __global__ void mul_mat_vec_q(
                         }
                     }
                 }
-                dst[j*stride_col_dst + i] = result;
+                dst[j*stride_col_dst + i] = skip_id ? 0.0f : result;
             }
         }
     }
@@ -888,7 +895,8 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
-    const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
+    const bool     skip_id   = ids[channel_dst + token_idx * ids_stride] < 0; // -1 id: write zeros
+    const uint32_t channel_x = skip_id ? 0 : ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
@@ -898,7 +906,7 @@ static __global__ void mul_mat_vec_q_moe(
     float tmp[c_rows_per_block] = {0.0f};
     float tmp_gate[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    for (int kbx = threadIdx.x / (qi/vdr); kbx < (skip_id ? 0 : blocks_per_row_x); kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
@@ -969,7 +977,7 @@ static __global__ void mul_mat_vec_q_moe(
                 }
             }
         }
-        dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = result;
+        dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = skip_id ? 0.0f : result;
     }
 
     if constexpr (!has_fusion) {

@@ -5674,8 +5674,51 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// host flags: let a stream wait for the CPU, so that GPU work which depends on a CPU computation
+// can be queued before the CPU has computed it
+static __global__ void k_wait_host_flag(const volatile int * flag, int value) {
+    while (*flag - value < 0) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+        __nanosleep(256);
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    }
+}
+
+static int * ggml_backend_cuda_host_flag_new(void) {
+    int * flag = nullptr;
+    if (cudaHostAlloc((void **) &flag, 64, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    *flag = 0;
+    return flag;
+}
+
+static void ggml_backend_cuda_host_flag_free(int * flag) {
+    CUDA_CHECK(cudaFreeHost(flag));
+}
+
+// the stream waits until *flag >= value (with wraparound)
+static void ggml_backend_cuda_host_flag_wait(ggml_backend_t backend, int * flag, int value) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    int * flag_dev = nullptr;
+    CUDA_CHECK(cudaHostGetDevicePointer((void **) &flag_dev, flag, 0));
+    k_wait_host_flag<<<1, 1, 0, cuda_ctx->stream()>>>(flag_dev, value);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_host_flag_new") == 0) {
+        return (void *)ggml_backend_cuda_host_flag_new;
+    }
+    if (strcmp(name, "ggml_backend_host_flag_free") == 0) {
+        return (void *)ggml_backend_cuda_host_flag_free;
+    }
+    if (strcmp(name, "ggml_backend_host_flag_wait") == 0) {
+        return (void *)ggml_backend_cuda_host_flag_wait;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
