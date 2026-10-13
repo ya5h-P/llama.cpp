@@ -1,126 +1,154 @@
-# llama.cpp
+# llama.cpp + MoE expert cache
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) (build b11046) that runs large Mixture-of-Experts models faster on small GPUs. It keeps the most used experts in a GPU cache, so that most of the expert math runs on the GPU even though the experts do not fit in VRAM.
 
-<div align="center">
+It was built and tuned for **Gemma 4 26B-A4B on an 8 GB laptop GPU**:
 
-<b>LLM inference in C/C++</b>
+| RTX 4060 Laptop 8 GB, i7-13620H, 64k context, MTP speculative decoding | tokens/s | VRAM |
+|---|---|---|
+| stock llama.cpp, best `--n-cpu-moe` | ~31 | 7.1 GB |
+| this fork, expert cache | **~62-69** | 7.5 GB |
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+The output is the same model computation: every expert is still computed exactly once, on the GPU or on the CPU. Greedy outputs only differ from stock llama.cpp at near-ties, the same way stock llama.cpp differs between two `--n-cpu-moe` settings.
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
-
-</div>
+This is a personal experiment, not an upstream feature. Only Gemma 4 is wired up, and it was only tested on one machine.
 
 ## Quick start
 
-A few options to get `llama.cpp` installed on your machine:
-
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
-
-Once installed:
+Requirements: Linux, an NVIDIA GPU with 8 GB or more and the CUDA toolkit, ~16 GB of RAM, ~15 GB of disk.
 
 ```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+git clone -b expert-cache https://github.com/ya5h-P/llama.cpp.git
+cd llama.cpp
 
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+# build (native = the GPU in this machine)
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target llama-server
+
+# download the model (14.3 GB) and the MTP drafter (0.25 GB) into models/
+scripts/expert-cache/download-models.sh
+
+# run
+scripts/expert-cache/serve-gemma4-26b.sh
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+The server has an OpenAI-compatible API on `http://127.0.0.1:8080/v1` with the model name `gemma-4-26b-a4b-qat`, and a web UI on `http://127.0.0.1:8080`:
 
-## Description
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"gemma-4-26b-a4b-qat","messages":[{"role":"user","content":"Hello"}]}'
+```
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+It serves one request at a time (`-np 1`); the second request slot would cost VRAM that the cache uses better.
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+### Settings
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+The script reads these environment variables, e.g. `CTX=32768 EC_SLOTS=24 scripts/expert-cache/serve-gemma4-26b.sh`:
 
-## Supported backends
+| variable | default | meaning |
+|---|---|---|
+| `CTX` | 65536 | context size |
+| `N_CPU_MOE` | 26 | layers whose experts stay in system RAM (Gemma 4 26B has 30) |
+| `EC_SLOTS` | 28 | GPU cache slots per CPU layer, `0` turns the cache off |
+| `EC_BUDGET` | 4 | experts copied to the GPU per token |
+| `THREADS` | 10 | CPU threads |
+| `MTP` / `DRAFT_N` | 1 / 4 | MTP speculative decoding on/off, and draft length |
+| `MODEL_DIR` | `models/` | where the GGUF files are |
+| `EXTRA` | | extra `llama-server` arguments |
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+**VRAM is the main knob.** Each slot costs ~3.35 MB per CPU layer, so 28 slots x 26 layers = 2.4 GB. Keep the total under ~7.5 GB on an 8 GB card: above that, the first request can stall. With a smaller context there is room for more slots (at 16k context, 32 slots gave +16% over 24). With less VRAM, lower `EC_SLOTS`.
 
-## Documentation
+The cache itself is controlled by environment variables read by `libllama`, so it also works with `llama-cli`, `llama-bench` and others:
 
-#### Tools
+| variable | meaning |
+|---|---|
+| `LLAMA_EXPERT_CACHE=n` | n GPU slots per MoE layer whose experts are in host memory (unset or 0 = off) |
+| `LLAMA_EXPERT_CACHE_BUDGET=n` | max experts copied per token (default 2) |
+| `LLAMA_EXPERT_CACHE_PROFILE=file` | initial expert usage, lines of `layer expert count` (`scripts/expert-cache/expert-profile.txt`) |
+| `LLAMA_EXPERT_CACHE_CHUNK=kb` | size of the copy chunks (default 256) |
+| `LLAMA_EXPERT_CACHE_PREFAULT=1` | map the pages of the memory-mapped experts at startup |
+| `GGML_SCHED_NO_EARLY_COPY=1` | disable the CPU/GPU overlap described below |
+| `GGML_SCHED_PRELAUNCH=1` | experimental, queue GPU work behind a host flag (no measured gain) |
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+With `-lv 4`, the server logs the cache hit rate every 256 tokens.
 
-#### Development
+## How it works
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
+### The problem
 
-## Contributing
+Gemma 4 26B-A4B has 30 layers. Each layer has 128 experts (small feed-forward networks of ~3.35 MB each at 4-bit), and every token uses only 8 of them per layer. So the model is 14 GB, but a token only reads ~1 GB of it.
 
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
+On an 8 GB GPU, the usual trick is `--n-cpu-moe N`: attention and the shared weights go to VRAM, and the experts of N layers stay in system RAM, where the CPU computes them. That works, but the CPU layers dominate the time. Profiling stock llama.cpp showed the GPU idle 66% of the time, waiting for the CPU.
 
-## Acknowledgements
+### The idea: cache the hot experts on the GPU
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+Expert usage is far from uniform, and it is sticky: 39% of the experts a token picks at a layer were also picked by the previous token. With 32 GPU slots per layer, a cache that keeps the recently used experts would serve ~70-80% of the picks.
+
+So each CPU layer gets `n` GPU slots holding copies of its hottest experts. For each token:
+
+1. The router picks 8 experts per layer, as usual.
+2. Two small lookup tables map each expert to its GPU slot, or to its CPU id. Experts not in the cache get slot `-1` on the GPU side, and cached experts get id `-1` on the CPU side.
+3. The GPU computes the cached experts from the slots, and the CPU computes the rest from RAM. `MUL_MAT_ID` was changed to skip `-1` ids (zero output rows), so each expert is computed by exactly one side.
+4. The two partial results are added, and the expert weights and scales are applied as usual.
+
+```
+            router -> 8 expert ids
+                 |
+       +---------+----------+
+  slot table            cpu_id table
+  (-1 = not cached)     (-1 = cached)
+       |                     |
+  GPU MUL_MAT_ID        CPU MUL_MAT_ID
+  on the cache slots    on the experts in RAM
+       |                     |
+       +------ add ----------+
+                 |
+            weighted sum
+```
+
+### Keeping the cache fresh
+
+After each step, the cache reads back the expert ids of every layer (one small copy) and updates a decayed usage score per expert (x0.9 per token, so it remembers the last ~10 tokens). Missed experts that score higher than the weakest slot are promoted, up to `EC_BUDGET` copies per token.
+
+Copies run on a background thread while the next tokens are computed. The slot is removed from the lookup table before its copy starts and published only after the copy is done, so a running graph never reads a half-copied expert. `expert-profile.txt` (expert usage counts recorded on sample prompts) fills the cache at startup, so the first tokens do not start cold.
+
+Predicting experts before they are needed was also studied and rejected: copying an expert over PCIe takes longer than the CPU takes to compute it, and the next layer's experts cannot be predicted reliably (38% accuracy). A copy only pays off when the expert is reused ~3 or more times, which is what the decayed score selects for.
+
+### Overlapping the GPU and the CPU
+
+The ggml scheduler runs the graph as a sequence of "splits", one per backend. Normally, before the CPU split runs, the scheduler waits for the whole previous GPU split to finish. Here, that includes the cached experts, so the CPU would sit idle while the GPU computes them.
+
+The scheduler change ("early copy") splits that GPU split at the last node the CPU needs. The CPU inputs are copied as soon as they are ready, the cached experts are launched asynchronously, and the CPU starts right away. The GPU and the CPU now compute their experts at the same time. This alone gave +12% without MTP and +20% with MTP.
+
+### What was measured to not matter
+
+- Async cache bookkeeping: the whole update takes ~55 us per step.
+- Hiding the GPU launch behind a host flag (`GGML_SCHED_PRELAUNCH`): the launch is already cheap. The CPU experts (~200-270 us per layer, against a ~130 us memory bandwidth floor) are the critical path.
+- Pinning threads to performance cores: slower than letting the OS schedule them.
+- A smaller `-ub`: frees little VRAM and makes prompt processing 40-65% slower.
+
+The remaining lever is the hit rate, i.e. more slots, i.e. more VRAM.
+
+## Code
+
+| file | change |
+|---|---|
+| `src/llama-expert-cache.{h,cpp}` | the cache: slots, lookup tables, scores, background copies |
+| `src/llama-graph.{h,cpp}` | `build_moe_exps_split`: the split GPU/CPU expert computation |
+| `src/models/gemma4.cpp` | passes the cache of each layer to `build_moe_ffn` |
+| `src/llama-context.cpp` | updates the cache after each computed batch |
+| `ggml/src/ggml-cpu/ggml-cpu.c`, `ggml/src/ggml-cuda/mmvq.cu` | `MUL_MAT_ID` skips `-1` ids |
+| `ggml/src/ggml-backend.cpp` | early copy (and the experimental prelaunch) in the scheduler |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | host flag wait kernel for the prelaunch |
+| `scripts/expert-cache/` | run and download scripts, startup profile |
+
+## Limitations
+
+- Only Gemma 4 is wired up. Another MoE model needs its `build_moe_ffn` call to pass `&model.layers[il].exp_cache` (see `src/models/gemma4.cpp`), and needs merged gate/up expert tensors, no expert biases, and a GELU or SiLU activation.
+- The cache is only used for batches of up to 8 tokens (generation and MTP verification). Prompt processing uses the normal path.
+- CUDA only, and only tested on Linux with one GPU.
+- Expert layers stored in repacked CPU formats are not cached.
+
+## Upstream
+
+Everything else is stock llama.cpp. See the [upstream README](https://github.com/ggml-org/llama.cpp/blob/master/README.md) for general usage, and [LICENSE](LICENSE) (MIT).
