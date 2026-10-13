@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "llama-arch.h"
+#include "llama-expert-cache.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -1408,6 +1409,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (model.exp_cache) {
+        // the cache slots can only change while no graph is running
+        ggml_backend_sched_synchronize(sched.get());
+        model.exp_cache->update(ubatch.n_tokens);
     }
 
     ret = GGML_STATUS_SUCCESS;

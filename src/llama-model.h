@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_expert_cache;
 
 // available models
 enum llm_type {
@@ -594,6 +595,8 @@ struct llama_layer {
     struct llama_layer_nextn nextn;
 
     struct llama_layer_switch_lora switch_lora;
+
+    struct llm_moe_expert_cache exp_cache;
 };
 
 struct llama_device {
@@ -711,6 +714,9 @@ struct llama_model {
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
+
+    // GPU cache of host-memory experts, null if disabled
+    std::unique_ptr<llama_expert_cache> exp_cache;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;

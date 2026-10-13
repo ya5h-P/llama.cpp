@@ -75,6 +75,20 @@ enum llm_norm_type {
     LLM_NORM_GROUP,
 };
 
+// larger batches take the normal MoE path; -1 expert ids are only handled by the small batch MUL_MAT_ID kernels
+#define LLAMA_EXPERT_CACHE_MAX_TOKENS 8
+
+// GPU copy of a subset of the experts of one MoE layer whose expert weights stay in host memory
+// see llama-expert-cache.h
+struct llm_moe_expert_cache {
+    ggml_tensor * gate_up = nullptr; // [n_embd, n_ff*2, n_slot]
+    ggml_tensor * down    = nullptr; // [n_ff, n_embd, n_slot]
+    ggml_tensor * slot    = nullptr; // [1, n_expert] I32: slot of the expert, -1 if not cached
+    ggml_tensor * cpu_id  = nullptr; // [1, n_expert] I32: -1 if cached, else the expert id
+    ggml_tensor * ids     = nullptr; // [n_expert_used*LLAMA_EXPERT_CACHE_MAX_TOKENS] I32: selected experts of the last batch
+    ggml_tensor * down_s  = nullptr; // GPU copy of ffn_down_exps_s, if any, so that no layer input comes from pageable memory
+};
+
 // TODO: tmp - need something better to pass the data from the encoder to the decoder
 struct llama_cross {
     // the output embeddings from the encoder as a ggml tensor
@@ -1129,7 +1143,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             const llm_moe_expert_cache * exp_cache = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1155,7 +1170,20 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             const llm_moe_expert_cache * exp_cache = nullptr) const;
+
+    // experts of the cached slots run on the GPU, the rest on the CPU; returns [n_embd, n_expert_used, n_tokens]
+    ggml_tensor * build_moe_exps_split(
+             ggml_tensor * cur,
+             ggml_tensor * gate_up_exps,
+             ggml_tensor * down_exps,
+             ggml_tensor * down_exps_s,
+             ggml_tensor * selected_experts,
+             ggml_tensor * selected_experts_cont,
+             const llm_moe_expert_cache & exp_cache,
+         llm_ffn_op_type   type_op,
+                     int   il) const;
 
     //
     // inputs

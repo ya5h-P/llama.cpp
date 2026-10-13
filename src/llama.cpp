@@ -5,6 +5,7 @@
 
 #include "llama-chat.h"
 #include "llama-context.h"
+#include "llama-expert-cache.h"
 #include "llama-mmap.h"
 #include "llama-vocab.h"
 #include "llama-model-loader.h"
@@ -369,6 +370,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
+
+        model->exp_cache = llama_expert_cache::init(*model);
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
