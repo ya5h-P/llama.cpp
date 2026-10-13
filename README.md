@@ -56,15 +56,16 @@ The scripts read these environment variables, e.g. `CTX=32768 EC_SLOTS=24 script
 |---|---|---|---|---|
 | `CTX` | 65536 | 65536 | 65536 | context size |
 | `N_CPU_MOE` | 26 of 30 | 24 of 24 | 46 of 48 | layers whose experts stay in system RAM |
-| `EC_SLOTS` | 28 of 128 | 14 of 32 | 26 of 128 | GPU cache slots per CPU layer (of the layer's experts), `0` turns the cache off |
+| `EC_SLOTS` | 27 of 128 | 14 of 32 | 26 of 128 | GPU cache slots per CPU layer (of the layer's experts), `0` turns the cache off |
 | `EC_BUDGET` | 4 | 2 | 8 | experts copied to the GPU per token |
 | `THREADS` | 10 | 10 | 10 | CPU threads |
-| `MTP` / `DRAFT_N` | 1 / 4 | | | MTP speculative decoding on/off, and draft length |
+| `UBATCH` | 1024 | | | prompt tokens per GPU pass (`-ub`), see [Prompt processing](#prompt-processing) |
+| `MTP` / `DRAFT_N` / `DRAFT_UB` | 1 / 4 / 128 | | | MTP speculative decoding on/off, draft length, and the drafter's own ubatch |
 | `NGRAM` | | 1 | 1 | n-gram speculative decoding on/off |
 | `MODEL_DIR` | `models/` | `models/` | `models/` | where the GGUF files are |
 | `EXTRA` | | | | extra `llama-server` arguments |
 
-**VRAM is the main knob.** Each slot costs one expert of VRAM per CPU layer: Gemma's 28 slots x 26 layers x 3.35 MB = 2.4 GB, Qwen3-Coder's 26 x 46 x 1.96 MB = 2.3 GB. Keep the total under ~7.5 GB on an 8 GB card: above that, the first request can stall. With a smaller context there is room for more slots (Gemma at 16k context: 32 slots gave +16% over 24). Qwen3-Coder has full attention in all 48 layers, so its context is expensive (~3.4 GB at 64k with the 8-bit KV cache) and a smaller context frees the most there. With less VRAM, lower `EC_SLOTS`.
+**VRAM is the main knob.** Each slot costs one expert of VRAM per CPU layer: Gemma's 27 slots x 26 layers x 3.35 MB = 2.3 GB, Qwen3-Coder's 26 x 46 x 1.96 MB = 2.3 GB. Keep the total under ~7.5 GB on an 8 GB card: above that, the first request can stall. With a smaller context there is room for more slots (Gemma at 16k context: 32 slots gave +16% over 24). Qwen3-Coder has full attention in all 48 layers, so its context is expensive (~3.4 GB at 64k with the 8-bit KV cache) and a smaller context frees the most there. With less VRAM, lower `EC_SLOTS`.
 
 **RAM matters too.** Every CPU layer has to stay in system RAM. If it does not fit, the experts are read from disk again and again and the speed collapses. That is why Qwen3-Coder uses UD-Q3_K_XL (13.8 GB): on a 16 GB machine, the IQ4_XS file (16.4 GB) with the cache was barely faster than stock llama.cpp (~32 vs ~28 tokens/s), and slower as soon as more layers moved to the CPU.
 
@@ -78,6 +79,7 @@ The cache itself is controlled by environment variables read by `libllama`, so i
 | `LLAMA_EXPERT_CACHE_CHUNK=kb` | size of the copy chunks (default 256) |
 | `LLAMA_EXPERT_CACHE_PREFAULT=1` | map the pages of the memory-mapped experts at startup |
 | `LLAMA_EXPERT_CACHE_PP=0` | prompt processing copies all experts from host memory, also the cached ones |
+| `LLAMA_DRAFT_UBATCH=n` | ubatch of the draft context (default: the same as `-ub`) |
 | `GGML_SCHED_NO_EARLY_COPY=1` | disable the CPU/GPU overlap described below |
 | `GGML_SCHED_PRELAUNCH=1` | experimental, queue GPU work behind a host flag (no measured gain) |
 
@@ -181,7 +183,15 @@ The experts that are already in the cache slots do not need to cross PCIe again.
 | gpt-oss-20b | 14 / 32 | ~540 | ~765 (+41%) |
 | Qwen3-Coder 30B | 26 / 128 | ~370-415 | ~440-470 (+15%) |
 
-A larger `-ub` halves the uploads per token but needs a larger compute buffer, i.e. fewer slots. For Gemma, 24 slots with `-ub 1024` (`EC_SLOTS=24 EXTRA="-ub 1024"`) gives ~690-845 prompt tokens/s against ~490-535, and generation gets ~5% slower. That is worth it when the prompts are long (coding agents).
+A larger `-ub` halves the uploads per token but needs larger compute buffers, i.e. fewer slots. With Gemma's MTP drafter, most of that cost was the drafter: its compute buffer is 366 MiB at `-ub 512` and 475 MiB at 1024, although it only drafts a few tokens. The draft context now has its own ubatch (`LLAMA_DRAFT_UBATCH`, 128 in the script: 285 MiB), so `-ub 1024` costs one slot instead of four:
+
+| Gemma 4, 64k context | slots | prompt tokens/s | chat tokens/s | code edit tokens/s | VRAM |
+|---|---|---|---|---|---|
+| `-ub 512` | 28 | ~480-540 | 59-69 | 72-80 | 7.50 GB |
+| `-ub 1024`, drafter ubatch 128 (default) | 27 | **~720-845** | 60-69 | 76 | 7.51 GB |
+| `-ub 2048`, drafter ubatch 128 | 21 | ~1050-1165 | 59 | 65 | 7.54 GB |
+
+`-ub 1024` is now the default. `-ub 2048` (`UBATCH=2048 EC_SLOTS=21`) doubles prompt speed again but generation gets ~10-15% slower.
 
 ### What was measured to not matter
 

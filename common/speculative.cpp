@@ -2500,6 +2500,14 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
+    // fork: the draft context can use a smaller ubatch than the target, its compute buffer grows with it
+    // (Gemma 4 MTP: 366 MiB at 512, 475 MiB at 1024), VRAM that the expert cache can use better
+    if (const char * ub = getenv("LLAMA_DRAFT_UBATCH")) {
+        if (atoi(ub) > 0) {
+            result.n_ubatch = std::min(atoi(ub), result.n_batch);
+        }
+    }
+
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types
     //       something like `struct common_speculative_type_props common_speculative_type_get_props(...);`

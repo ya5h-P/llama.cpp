@@ -5,9 +5,11 @@
 # Settings (env), defaults tuned on an RTX 4060 Laptop 8 GB + i7-13620H:
 #   CTX=65536     context size
 #   N_CPU_MOE=26  layers whose experts stay in system RAM (the other 4 are fully on the GPU)
-#   EC_SLOTS=28   GPU cache slots per CPU layer (0 = cache off, stock llama.cpp behavior)
+#   EC_SLOTS=27   GPU cache slots per CPU layer (0 = cache off, stock llama.cpp behavior)
 #   EC_BUDGET=4   experts copied to the GPU per token
 #   THREADS=10    CPU threads
+#   UBATCH=1024   prompt tokens per GPU pass: prompts are PCIe-bound, 1024 is ~1.5x faster than 512
+#   DRAFT_UB=128  the MTP drafter's own ubatch: its compute buffer grows with it, 128 keeps -ub 1024 nearly free
 #   MTP=1         MTP speculative decoding (0 = off), DRAFT_N=4 draft tokens
 #   MODEL_DIR     where the GGUF files are (default: models/ in this repo)
 #   EXTRA         extra llama-server arguments
@@ -25,8 +27,9 @@ if [[ "${MTP:-1}" == 1 ]]; then
         --spec-type draft-mtp --spec-draft-n-max "${DRAFT_N:-4}")
 fi
 
-export LLAMA_EXPERT_CACHE="${EC_SLOTS:-28}"
+export LLAMA_EXPERT_CACHE="${EC_SLOTS:-27}"
 export LLAMA_EXPERT_CACHE_BUDGET="${EC_BUDGET:-4}"
+export LLAMA_DRAFT_UBATCH="${DRAFT_UB:-128}"
 export LLAMA_EXPERT_CACHE_PROFILE="${EC_PROFILE:-$HERE/expert-profile.txt}"
 
 exec "$BIN" \
@@ -35,7 +38,7 @@ exec "$BIN" \
   --alias gemma-4-26b-a4b-qat \
   --host "${HOST:-127.0.0.1}" --port "${PORT:-8080}" \
   -ngl 99 --n-cpu-moe "${N_CPU_MOE:-26}" \
-  -c "${CTX:-65536}" -fa on -ctk q8_0 -ctv q8_0 \
+  -c "${CTX:-65536}" -fa on -ctk q8_0 -ctv q8_0 -ub "${UBATCH:-1024}" \
   -t "${THREADS:-10}" -tb "${THREADS:-10}" -np 1 \
   --jinja \
   ${EXTRA:-}
