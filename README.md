@@ -8,8 +8,9 @@ It works with any MoE model built through llama.cpp's shared `build_moe_ffn` (se
 |---|---|---|
 | Gemma 4 26B-A4B (UD-Q4_K_XL, MTP speculative decoding) | ~31 tokens/s | **~62-69 tokens/s** |
 | gpt-oss-20b (Q4_K_M, no speculative decoding) | ~45 tokens/s | **~55-58 tokens/s** |
+| Qwen3-Coder-30B-A3B (UD-Q3_K_XL, no speculative decoding) | ~30 tokens/s | **~48 tokens/s** |
 
-Both runs use ~7.3-7.5 GB of VRAM. The gain is largest when many small experts are reused often (Gemma: 128 experts of 3.35 MB) and smaller with a few large ones (gpt-oss: 32 experts of 13 MB).
+All runs use ~7.3-7.5 GB of VRAM. The gain is largest when many small experts are reused often (Gemma: 128 experts of 3.35 MB per layer) and smaller with a few large ones (gpt-oss: 32 experts of 13 MB). gpt-oss and Qwen3-Coder have no MTP drafter, but n-gram speculative decoding (see [Speculative decoding](#speculative-decoding)) brings their code edits to ~81 and ~58 tokens/s.
 
 The output is the same model computation: every expert is still computed exactly once, on the GPU or on the CPU. Greedy outputs only differ from stock llama.cpp at near-ties, the same way stock llama.cpp differs between two `--n-cpu-moe` settings.
 
@@ -17,48 +18,57 @@ This is a personal experiment, not an upstream feature, tested on one machine.
 
 ## Quick start
 
-Requirements: Linux, an NVIDIA GPU with 8 GB or more and the CUDA toolkit, ~16 GB of RAM, ~15 GB of disk.
+Requirements: Linux, an NVIDIA GPU with 8 GB or more and the CUDA toolkit, ~16 GB of RAM, and 12-15 GB of disk per model.
 
 ```sh
-git clone -b expert-cache https://github.com/ya5h-P/llama.cpp.git
+git clone -b expert-cache-generic https://github.com/ya5h-P/llama.cpp.git
 cd llama.cpp
 
 # build (native = the GPU in this machine)
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j --target llama-server
 
-# download the model (14.3 GB) and the MTP drafter (0.25 GB) into models/
-scripts/expert-cache/download-models.sh
-
-# run
+# download a model into models/ and run it, one of:
+scripts/expert-cache/download-models.sh gemma         # 14.3 GB + 0.25 GB MTP drafter
 scripts/expert-cache/serve-gemma4-26b.sh
+
+scripts/expert-cache/download-models.sh gpt-oss       # 11.6 GB
+scripts/expert-cache/serve-gpt-oss-20b.sh
+
+scripts/expert-cache/download-models.sh qwen3-coder   # 13.8 GB
+scripts/expert-cache/serve-qwen3-coder-30b.sh
 ```
 
-The server has an OpenAI-compatible API on `http://127.0.0.1:8080/v1` with the model name `gemma-4-26b-a4b-qat`, and a web UI on `http://127.0.0.1:8080`:
+The `expert-cache` branch is the first version, which only supports Gemma 4. `expert-cache-generic` works with other MoE models and has all three scripts.
+
+The server has an OpenAI-compatible API on `http://127.0.0.1:8080/v1` and a web UI on `http://127.0.0.1:8080`. The model names are `gemma-4-26b-a4b-qat`, `gpt-oss-20b` and `qwen3-coder-30b-a3b`:
 
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"gemma-4-26b-a4b-qat","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-It serves one request at a time (`-np 1`); the second request slot would cost VRAM that the cache uses better.
+All three use port 8080, so run one at a time. Each serves one request at a time (`-np 1`); a second request slot would cost VRAM that the cache uses better.
 
 ### Settings
 
-The script reads these environment variables, e.g. `CTX=32768 EC_SLOTS=24 scripts/expert-cache/serve-gemma4-26b.sh`:
+The scripts read these environment variables, e.g. `CTX=32768 EC_SLOTS=24 scripts/expert-cache/serve-gemma4-26b.sh`. The defaults are tuned per model for an 8 GB GPU at 64k context:
 
-| variable | default | meaning |
-|---|---|---|
-| `CTX` | 65536 | context size |
-| `N_CPU_MOE` | 26 | layers whose experts stay in system RAM (Gemma 4 26B has 30) |
-| `EC_SLOTS` | 28 | GPU cache slots per CPU layer, `0` turns the cache off |
-| `EC_BUDGET` | 4 | experts copied to the GPU per token |
-| `THREADS` | 10 | CPU threads |
-| `MTP` / `DRAFT_N` | 1 / 4 | MTP speculative decoding on/off, and draft length |
-| `MODEL_DIR` | `models/` | where the GGUF files are |
-| `EXTRA` | | extra `llama-server` arguments |
+| variable | Gemma 4 26B | gpt-oss-20b | Qwen3-Coder 30B | meaning |
+|---|---|---|---|---|
+| `CTX` | 65536 | 65536 | 65536 | context size |
+| `N_CPU_MOE` | 26 of 30 | 24 of 24 | 46 of 48 | layers whose experts stay in system RAM |
+| `EC_SLOTS` | 28 of 128 | 14 of 32 | 26 of 128 | GPU cache slots per CPU layer (of the layer's experts), `0` turns the cache off |
+| `EC_BUDGET` | 4 | 2 | 8 | experts copied to the GPU per token |
+| `THREADS` | 10 | 10 | 10 | CPU threads |
+| `MTP` / `DRAFT_N` | 1 / 4 | | | MTP speculative decoding on/off, and draft length |
+| `NGRAM` | | 1 | 1 | n-gram speculative decoding on/off |
+| `MODEL_DIR` | `models/` | `models/` | `models/` | where the GGUF files are |
+| `EXTRA` | | | | extra `llama-server` arguments |
 
-**VRAM is the main knob.** Each slot costs ~3.35 MB per CPU layer, so 28 slots x 26 layers = 2.4 GB. Keep the total under ~7.5 GB on an 8 GB card: above that, the first request can stall. With a smaller context there is room for more slots (at 16k context, 32 slots gave +16% over 24). With less VRAM, lower `EC_SLOTS`.
+**VRAM is the main knob.** Each slot costs one expert of VRAM per CPU layer: Gemma's 28 slots x 26 layers x 3.35 MB = 2.4 GB, Qwen3-Coder's 26 x 46 x 1.96 MB = 2.3 GB. Keep the total under ~7.5 GB on an 8 GB card: above that, the first request can stall. With a smaller context there is room for more slots (Gemma at 16k context: 32 slots gave +16% over 24). Qwen3-Coder has full attention in all 48 layers, so its context is expensive (~3.4 GB at 64k with the 8-bit KV cache) and a smaller context frees the most there. With less VRAM, lower `EC_SLOTS`.
+
+**RAM matters too.** Every CPU layer has to stay in system RAM. If it does not fit, the experts are read from disk again and again and the speed collapses. That is why Qwen3-Coder uses UD-Q3_K_XL (13.8 GB): on a 16 GB machine, the IQ4_XS file (16.4 GB) with the cache was barely faster than stock llama.cpp (~32 vs ~28 tokens/s), and slower as soon as more layers moved to the CPU.
 
 The cache itself is controlled by environment variables read by `libllama`, so it also works with `llama-cli`, `llama-bench` and others:
 
@@ -66,13 +76,49 @@ The cache itself is controlled by environment variables read by `libllama`, so i
 |---|---|
 | `LLAMA_EXPERT_CACHE=n` | n GPU slots per MoE layer whose experts are in host memory (unset or 0 = off) |
 | `LLAMA_EXPERT_CACHE_BUDGET=n` | max experts copied per token (default 2) |
-| `LLAMA_EXPERT_CACHE_PROFILE=file` | initial expert usage, lines of `layer expert count` (`scripts/expert-cache/expert-profile.txt`) |
+| `LLAMA_EXPERT_CACHE_PROFILE=file` | initial expert usage, lines of `layer expert count` (`scripts/expert-cache/expert-profile.txt`, for Gemma 4) |
 | `LLAMA_EXPERT_CACHE_CHUNK=kb` | size of the copy chunks (default 256) |
 | `LLAMA_EXPERT_CACHE_PREFAULT=1` | map the pages of the memory-mapped experts at startup |
 | `GGML_SCHED_NO_EARLY_COPY=1` | disable the CPU/GPU overlap described below |
 | `GGML_SCHED_PRELAUNCH=1` | experimental, queue GPU work behind a host flag (no measured gain) |
 
 With `-lv 4`, the server logs the cache hit rate every 256 tokens.
+
+### Speculative decoding
+
+Speculative decoding guesses a few tokens ahead and lets the model check them all in one pass. The model still picks every token, so the output only changes at near-ties, as above. The cache handles batches of up to 8 tokens, so drafts are capped at 7.
+
+Gemma 4 has a trained MTP drafter, which predicts the next tokens from the model's own hidden state. It is on by default.
+
+gpt-oss and Qwen3-Coder have none, so their scripts use n-gram drafting (`ngram-mod`) instead. It needs no extra model or VRAM: it looks for the last few tokens earlier in the context and proposes what followed them there. That works when the answer repeats the context, which is common for code:
+
+| | new text | code edit (rewrite a pasted file) |
+|---|---|---|
+| gpt-oss-20b, cache | ~58 tokens/s | ~60 tokens/s |
+| gpt-oss-20b, cache + n-gram | ~55 tokens/s | **~81 tokens/s** |
+| Qwen3-Coder, cache | ~48 tokens/s | ~38 tokens/s |
+| Qwen3-Coder, cache + n-gram | ~46 tokens/s | **~58 tokens/s** |
+
+New text gets a few percent slower, so set `NGRAM=0` for chat-only use.
+
+On Gemma, adding n-gram to MTP made code edits slower (~80 -> ~75 tokens/s): llama.cpp tries n-gram first, and its drafts replace MTP's better ones.
+
+### Other models
+
+Any other MoE GGUF works with `llama-server` directly, for example:
+
+```sh
+LLAMA_EXPERT_CACHE=14 LLAMA_EXPERT_CACHE_BUDGET=2 build/bin/llama-server \
+  -m models/gpt-oss-20b-Q4_K_M.gguf --jinja -ngl 99 --n-cpu-moe 24 \
+  -c 65536 -fa on -t 10 -tb 10 -np 1
+```
+
+To tune a new model:
+
+1. Find the lowest `--n-cpu-moe` that fits with stock llama.cpp (cache off).
+2. Raise it and add slots while VRAM stays under the limit. Moving more layers to the CPU frees VRAM, and slots usually pay that back (gpt-oss: 13 CPU layers stock, 24 layers x 14 slots with the cache).
+3. Pick the budget by expert size: large experts favour a small budget (gpt-oss, 13 MB: 2), small ones a larger one (Qwen3-Coder, 2 MB: 8).
+4. Check that the CPU layers fit in RAM: if `free` shows little memory left and the speed drops when adding CPU layers, go back a step or use a smaller quant.
 
 ## How it works
 
@@ -143,13 +189,13 @@ The remaining lever is the hit rate, i.e. more slots, i.e. more VRAM.
 | `ggml/src/ggml-cpu/ggml-cpu.c`, `ggml/src/ggml-cuda/mmvq.cu` | `MUL_MAT_ID` skips `-1` ids |
 | `ggml/src/ggml-backend.cpp` | early copy (and the experimental prelaunch) in the scheduler |
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | host flag wait kernel for the prelaunch |
-| `scripts/expert-cache/` | run and download scripts, startup profile |
+| `scripts/expert-cache/` | serve scripts for Gemma 4, gpt-oss and Qwen3-Coder, download script, Gemma startup profile |
 
 ## Limitations
 
-- The model has to build its experts with `build_moe_ffn` (nearly all MoE models in llama.cpp do), with a gated FFN (merged `gate_up` or separate `gate` and `up` tensors). Layers with per-expert gate/up scales, weights applied before the FFN, or LoRA adapters fall back to the normal path. Tested on Gemma 4 26B-A4B and gpt-oss-20b.
+- The model has to build its experts with `build_moe_ffn` (nearly all MoE models in llama.cpp do), with a gated FFN (merged `gate_up` or separate `gate` and `up` tensors). Layers with per-expert gate/up scales, weights applied before the FFN, or LoRA adapters fall back to the normal path. Tested on Gemma 4 26B-A4B, gpt-oss-20b and Qwen3-Coder-30B-A3B.
 - The startup profile in `scripts/expert-cache/` is for Gemma 4. Other models start without one (unset `LLAMA_EXPERT_CACHE_PROFILE`) and learn their hot experts as they run.
-- The cache is only used for batches of up to 8 tokens (generation and MTP verification). Prompt processing uses the normal path.
+- The cache is only used for batches of up to 8 tokens (generation and the check of up to 7 speculative tokens). Prompt processing uses the normal path.
 - CUDA only, and only tested on Linux with one GPU.
 - Expert layers stored in repacked CPU formats are not cached.
 
