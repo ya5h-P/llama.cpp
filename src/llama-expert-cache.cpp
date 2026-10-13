@@ -156,6 +156,18 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::init(llama_model & model
         ggml_format_name(c.ids, "blk.%d.ffn_exps_cache_ids", cl.il);
     }
 
+    for (size_t li = 0; li < ec->layers.size(); ++li) {
+        for (size_t ti = 0; ti < ec->layers[li].exps.size(); ++ti) {
+            ec->exps_index[ec->layers[li].exps[ti].src] = { (int) li, (int) ti };
+        }
+    }
+    ggml_init_params params_views = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ec->ctx_views = ggml_init(params_views);
+
     ec->buf = ggml_backend_alloc_ctx_tensors_from_buft(ec->ctx, ggml_backend_dev_buffer_type(dev));
     if (ec->buf == nullptr) {
         for (auto & cl : ec->layers) {
@@ -255,6 +267,13 @@ llama_expert_cache::~llama_expert_cache() {
         LLAMA_LOG_INFO("%s: %lld tokens, hit rate %.1f%%, %.2f promotions/token\n", __func__,
                 (long long) n_tok, 100.0*n_hit/n_pick, (double) n_promo/std::max<int64_t>(1, n_tok));
     }
+    if (n_copy_dev + n_copy_host > 0) {
+        LLAMA_LOG_INFO("%s: large batches: %.1f GiB of experts copied from the slots, %.1f GiB from host memory\n", __func__,
+                n_copy_dev/1024.0/1024.0/1024.0, n_copy_host/1024.0/1024.0/1024.0);
+    }
+    if (ctx_views) {
+        ggml_free(ctx_views);
+    }
     if (buf) {
         ggml_backend_buffer_free(buf);
     }
@@ -274,6 +293,49 @@ void llama_expert_cache::copy_expert(const layer & l, int s, int e) {
     for (const auto & t : l.exps) {
         tensor_set_chunked(*t.dst, (const char *) t.src->data + e*t.src->nb[2], s*(*t.dst)->nb[2], t.src->nb[2], chunk);
     }
+}
+
+int64_t llama_expert_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, int64_t e, int64_t last) {
+    const auto it = exps_index.find(src);
+    if (it == exps_index.end()) {
+        return -(last - e + 1);
+    }
+    const layer & l = layers[it->second.first];
+    ggml_tensor * slots = *l.exps[it->second.second].dst;
+
+    const size_t size = src->nb[2];
+
+    if (l.slot[e] < 0) {
+        int64_t n = 1;
+        while (e + n <= last && l.slot[e + n] < 0) {
+            n++;
+        }
+        n_copy_host += n*size;
+        return -n;
+    }
+
+    int64_t n = 0;
+    for (; e + n <= last && l.slot[e + n] >= 0; ++n) {
+        ggml_reset(ctx_views);
+        ggml_tensor * src_view = ggml_view_3d(ctx_views, slots, slots->ne[0], slots->ne[1], 1, slots->nb[1], slots->nb[2], l.slot[e + n]*slots->nb[2]);
+        ggml_tensor * dst_view = ggml_view_3d(ctx_views, dst,   dst->ne[0],   dst->ne[1],   1, dst->nb[1],   dst->nb[2],   (e + n)*dst->nb[2]);
+        ggml_backend_view_init(src_view);
+        ggml_backend_view_init(dst_view);
+        ggml_backend_tensor_copy_async(backend, backend, src_view, dst_view);
+    }
+    n_copy_dev += n*size;
+
+    // as the scheduler does for the host copies: MMQ reads a bit past the last expert, it must not be NaN
+    // only needed at the end of the run of used experts, else the next expert is copied anyway
+    const int64_t next = e + n;
+    if (next > last && next < n_expert) {
+        ggml_backend_tensor_set_async(backend, dst, (const char *) src->data + next*size, next*dst->nb[2], std::min<size_t>(size, 512));
+    }
+    return n;
+}
+
+int64_t llama_expert_cache::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, int64_t e, int64_t last, void * user_data) {
+    return ((llama_expert_cache *) user_data)->copy_experts(backend, src, dst, e, last);
 }
 
 void llama_expert_cache::upload_tables() {

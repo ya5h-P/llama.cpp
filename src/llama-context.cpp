@@ -580,6 +580,14 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
+// large batches read the cached experts from the GPU slots instead of copying them from host memory again
+void llama_context::set_expert_copy_callback() {
+    const char * env = getenv("LLAMA_EXPERT_CACHE_PP");
+    if (model.exp_cache && (env == nullptr || atoi(env) != 0)) {
+        ggml_backend_sched_set_expert_copy_callback(sched.get(), llama_expert_cache::sched_copy_experts, model.exp_cache.get());
+    }
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -607,6 +615,7 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    set_expert_copy_callback();
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -642,6 +651,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                set_expert_copy_callback();
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {

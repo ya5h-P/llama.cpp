@@ -831,6 +831,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
 
+    ggml_backend_sched_expert_copy_callback callback_expert_copy;
+    void * callback_expert_copy_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1899,7 +1902,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     // group consecutive experts and copy them together
-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                    auto copy_experts_host = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
@@ -1911,6 +1914,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
+                    };
+
+                    // the experts that the user already has on the device are copied by the callback
+                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                        if (sched->callback_expert_copy == nullptr) {
+                            copy_experts_host(first_id, last_id);
+                            return;
+                        }
+                        for (int64_t e = first_id; e <= last_id; ) {
+                            const int64_t n = sched->callback_expert_copy(split_backend, input, input_cpy, e, last_id,
+                                    sched->callback_expert_copy_user_data);
+                            GGML_ASSERT(n != 0 && e + std::abs(n) - 1 <= last_id);
+                            if (n < 0) {
+                                copy_experts_host((int32_t) e, (int32_t) (e - n - 1));
+                            }
+                            e += std::abs(n);
+                        }
                     };
 
                     int id = 0;
@@ -2270,6 +2290,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_expert_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_copy_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_expert_copy = callback;
+    sched->callback_expert_copy_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

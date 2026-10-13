@@ -315,6 +315,12 @@ extern "C" {
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
+    // Expert copy callback, used when the experts of a MoE weight in host memory are copied to backend for a MUL_MAT_ID
+    // the user may already have some experts on the device: if expert e is one of them, the callback copies the run of
+    // such experts from e up to at most expert last into dst and returns their number, else it copies nothing and returns
+    // minus the number of experts from e up to at most last that the scheduler has to copy from src
+    typedef int64_t (*ggml_backend_sched_expert_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, int64_t e, int64_t last, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -352,6 +358,9 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+
+    // Set a callback that copies the experts of host MoE weights that are already on the device (see above)
+    GGML_API void                 ggml_backend_sched_set_expert_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_copy_callback callback, void * user_data);
 
     //
     // Meta backend

@@ -77,6 +77,7 @@ The cache itself is controlled by environment variables read by `libllama`, so i
 | `LLAMA_EXPERT_CACHE_PROFILE=file` | initial expert usage, lines of `layer expert count` (`scripts/expert-cache/expert-profile.txt`, for Gemma 4) |
 | `LLAMA_EXPERT_CACHE_CHUNK=kb` | size of the copy chunks (default 256) |
 | `LLAMA_EXPERT_CACHE_PREFAULT=1` | map the pages of the memory-mapped experts at startup |
+| `LLAMA_EXPERT_CACHE_PP=0` | prompt processing copies all experts from host memory, also the cached ones |
 | `GGML_SCHED_NO_EARLY_COPY=1` | disable the CPU/GPU overlap described below |
 | `GGML_SCHED_PRELAUNCH=1` | experimental, queue GPU work behind a host flag (no measured gain) |
 
@@ -168,12 +169,26 @@ The ggml scheduler runs the graph as a sequence of "splits", one per backend. No
 
 The scheduler change ("early copy") splits that GPU split at the last node the CPU needs. The CPU inputs are copied as soon as they are ready, the cached experts are launched asynchronously, and the CPU starts right away. The GPU and the CPU now compute their experts at the same time. This alone gave +12% without MTP and +20% with MTP.
 
+### Prompt processing
+
+For large batches (prompts), llama.cpp computes the experts of the CPU layers on the GPU anyway: it uploads the experts the batch uses, which is nearly all of them, once per `-ub` tokens. This is limited by PCIe: for Gemma 4, ~11 GB per 512 tokens at ~10 GB/s.
+
+The experts that are already in the cache slots do not need to cross PCIe again. A scheduler callback copies them from the slots (GPU to GPU) and only the others come from host memory. The output is bit-identical. On a ~11-12k token prompt:
+
+| model | slots / experts | prompt tokens/s before | after |
+|---|---|---|---|
+| Gemma 4 26B | 28 / 128 | ~430-475 | ~490-535 (+15%) |
+| gpt-oss-20b | 14 / 32 | ~540 | ~765 (+41%) |
+| Qwen3-Coder 30B | 26 / 128 | ~370-415 | ~440-470 (+15%) |
+
+A larger `-ub` halves the uploads per token but needs a larger compute buffer, i.e. fewer slots. For Gemma, 24 slots with `-ub 1024` (`EC_SLOTS=24 EXTRA="-ub 1024"`) gives ~690-845 prompt tokens/s against ~490-535, and generation gets ~5% slower. That is worth it when the prompts are long (coding agents).
+
 ### What was measured to not matter
 
 - Async cache bookkeeping: the whole update takes ~55 us per step.
 - Hiding the GPU launch behind a host flag (`GGML_SCHED_PRELAUNCH`): the launch is already cheap. The CPU experts (~200-270 us per layer, against a ~130 us memory bandwidth floor) are the critical path.
 - Pinning threads to performance cores: slower than letting the OS schedule them.
-- A smaller `-ub`: frees little VRAM and makes prompt processing 40-65% slower.
+- A smaller `-ub`: frees little VRAM and makes prompt processing 40-65% slower (prompts are PCIe-bound, see above).
 
 The remaining lever is the hit rate, i.e. more slots, i.e. more VRAM.
 
@@ -185,7 +200,7 @@ The remaining lever is the hit rate, i.e. more slots, i.e. more VRAM.
 | `src/llama-graph.{h,cpp}` | `build_moe_ffn` looks up the layer's cache; `build_moe_exps_split`: the split GPU/CPU expert computation; `build_moe_act`: the activation shared by both paths |
 | `src/llama-context.cpp` | passes the per-layer caches to the graph, updates the cache after each computed batch |
 | `ggml/src/ggml-cpu/ggml-cpu.c`, `ggml/src/ggml-cuda/mmvq.cu` | `MUL_MAT_ID` skips `-1` ids |
-| `ggml/src/ggml-backend.cpp` | early copy (and the experimental prelaunch) in the scheduler |
+| `ggml/src/ggml-backend.cpp`, `ggml/include/ggml-backend.h` | early copy (and the experimental prelaunch) in the scheduler; expert copy callback for large batches |
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | host flag wait kernel for the prelaunch |
 | `scripts/expert-cache/` | serve scripts for Gemma 4, gpt-oss and Qwen3-Coder, download script, Gemma startup profile |
 
@@ -193,7 +208,7 @@ The remaining lever is the hit rate, i.e. more slots, i.e. more VRAM.
 
 - The model has to build its experts with `build_moe_ffn` (nearly all MoE models in llama.cpp do), with a gated FFN (merged `gate_up` or separate `gate` and `up` tensors). Layers with per-expert gate/up scales, weights applied before the FFN, or LoRA adapters fall back to the normal path. Tested on Gemma 4 26B-A4B, gpt-oss-20b and Qwen3-Coder-30B-A3B.
 - The startup profile in `scripts/expert-cache/` is for Gemma 4. Other models start without one (unset `LLAMA_EXPERT_CACHE_PROFILE`) and learn their hot experts as they run.
-- The cache is only used for batches of up to 8 tokens (generation and the check of up to 7 speculative tokens). Prompt processing uses the normal path.
+- The split GPU/CPU computation is only used for batches of up to 8 tokens (generation and the check of up to 7 speculative tokens). Larger batches use the normal op offload path, which only reads the cached experts from the slots.
 - CUDA only, and only tested on Linux with one GPU.
 - Expert layers stored in repacked CPU formats are not cached.
 

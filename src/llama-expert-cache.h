@@ -5,8 +5,11 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
+struct ggml_backend;
 struct ggml_context;
 struct ggml_tensor;
 struct ggml_backend_buffer;
@@ -31,6 +34,13 @@ struct llama_expert_cache {
 
     // [n_layer] cache of each layer, nullptr for layers that are not cached; build_moe_ffn looks the layer up here
     std::vector<const llm_moe_expert_cache *> layer_caches;
+
+    // large batches copy the used experts of the host layers to the GPU (op offload): the cached experts are
+    // copied from their slots instead of from host memory (ggml_backend_sched_expert_copy_callback)
+    // the slots in the lookup tables do not change while a graph is computed
+    int64_t copy_experts(ggml_backend * backend, const ggml_tensor * src, ggml_tensor * dst, int64_t e, int64_t last);
+
+    static int64_t sched_copy_experts(ggml_backend * backend, const ggml_tensor * src, ggml_tensor * dst, int64_t e, int64_t last, void * user_data);
 
 private:
     struct layer {
@@ -78,6 +88,11 @@ private:
 
     ggml_context        * ctx = nullptr;
     ggml_backend_buffer * buf = nullptr;
+
+    ggml_context * ctx_views = nullptr; // views used by copy_experts
+
+    // host expert tensor -> (index in layers, index in exps)
+    std::unordered_map<const ggml_tensor *, std::pair<int, int>> exps_index;
     ggml_tensor         * ids    = nullptr; // [n_used*LLAMA_EXPERT_CACHE_MAX_TOKENS, n_layer] I32
     ggml_tensor         * tables = nullptr; // [n_expert, 2, n_layer] I32: slot and cpu_id of each layer
 
@@ -100,6 +115,9 @@ private:
     int64_t n_hit    = 0;
     int64_t n_promo  = 0;
     int64_t n_report = 0;
+
+    int64_t n_copy_dev  = 0; // bytes of the op offload copies served from the slots
+    int64_t n_copy_host = 0; // bytes of the op offload copies from host memory
 
     int64_t n_update = 0;
     int64_t t_wait   = 0;
