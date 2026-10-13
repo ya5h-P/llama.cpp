@@ -56,7 +56,7 @@ The scripts read these environment variables, e.g. `CTX=32768 EC_SLOTS=24 script
 |---|---|---|---|---|
 | `CTX` | 65536 | 65536 | 65536 | context size |
 | `N_CPU_MOE` | 26 of 30 | 24 of 24 | 46 of 48 | layers whose experts stay in system RAM |
-| `EC_SLOTS` | 27 of 128 | 14 of 32 | 26 of 128 | GPU cache slots per CPU layer (of the layer's experts), `0` turns the cache off |
+| `EC_SLOTS` | 31 of 128 | 14 of 32 | 26 of 128 | GPU cache slots per CPU layer (of the layer's experts), `0` turns the cache off |
 | `EC_BUDGET` | 4 | 2 | 8 | experts copied to the GPU per token |
 | `THREADS` | 10 | 10 | 10 | CPU threads |
 | `UBATCH` | 1024 | | | prompt tokens per GPU pass (`-ub`), see [Prompt processing](#prompt-processing) |
@@ -65,7 +65,7 @@ The scripts read these environment variables, e.g. `CTX=32768 EC_SLOTS=24 script
 | `MODEL_DIR` | `models/` | `models/` | `models/` | where the GGUF files are |
 | `EXTRA` | | | | extra `llama-server` arguments |
 
-**VRAM is the main knob.** Each slot costs one expert of VRAM per CPU layer: Gemma's 27 slots x 26 layers x 3.35 MB = 2.3 GB, Qwen3-Coder's 26 x 46 x 1.96 MB = 2.3 GB. Keep the total under ~7.5 GB on an 8 GB card: above that, the first request can stall. With a smaller context there is room for more slots (Gemma at 16k context: 32 slots gave +16% over 24). Qwen3-Coder has full attention in all 48 layers, so its context is expensive (~3.4 GB at 64k with the 8-bit KV cache) and a smaller context frees the most there. With less VRAM, lower `EC_SLOTS`.
+**VRAM is the main knob.** Each slot costs one expert of VRAM per CPU layer: Gemma's 31 slots x 26 layers x 3.35 MB = 2.7 GB, Qwen3-Coder's 26 x 46 x 1.96 MB = 2.3 GB. Keep the total under ~7.5 GB on an 8 GB card: above that, the first request can stall. With a smaller context there is room for more slots (Gemma at 16k context: 32 slots gave +16% over 24). Qwen3-Coder has full attention in all 48 layers, so its context is expensive (~3.4 GB at 64k with the 8-bit KV cache) and a smaller context frees the most there. With less VRAM, lower `EC_SLOTS`.
 
 **RAM matters too.** Every CPU layer has to stay in system RAM. If it does not fit, the experts are read from disk again and again and the speed collapses. That is why Qwen3-Coder uses UD-Q3_K_XL (13.8 GB): on a 16 GB machine, the IQ4_XS file (16.4 GB) with the cache was barely faster than stock llama.cpp (~32 vs ~28 tokens/s), and slower as soon as more layers moved to the CPU.
 
@@ -80,6 +80,8 @@ The cache itself is controlled by environment variables read by `libllama`, so i
 | `LLAMA_EXPERT_CACHE_PREFAULT=1` | map the pages of the memory-mapped experts at startup |
 | `LLAMA_EXPERT_CACHE_PP=0` | prompt processing copies all experts from host memory, also the cached ones |
 | `LLAMA_DRAFT_UBATCH=n` | ubatch of the draft context (default: the same as `-ub`) |
+| `GGML_CUDA_FA_SHARED_F16=0` | the drafter keeps its own flash attention scratch instead of borrowing the target's compute buffer (see below) |
+| `GGML_SCHED_HOIST_INPUTS=0` | copy graph inputs to the GPU where they are first used, not at the start of the graph (see below) |
 | `GGML_SCHED_NO_EARLY_COPY=1` | disable the CPU/GPU overlap described below |
 | `GGML_SCHED_PRELAUNCH=1` | experimental, queue GPU work behind a host flag (no measured gain) |
 
@@ -188,10 +190,24 @@ A larger `-ub` halves the uploads per token but needs larger compute buffers, i.
 | Gemma 4, 64k context | slots | prompt tokens/s | chat tokens/s | code edit tokens/s | VRAM |
 |---|---|---|---|---|---|
 | `-ub 512` | 28 | ~480-540 | 59-69 | 72-80 | 7.50 GB |
-| `-ub 1024`, drafter ubatch 128 (default) | 27 | **~720-845** | 60-69 | 76 | 7.51 GB |
+| `-ub 1024`, drafter ubatch 128 | 27 | ~720-845 | 60-69 | 76 | 7.51 GB |
 | `-ub 2048`, drafter ubatch 128 | 21 | ~1050-1165 | 59 | 65 | 7.54 GB |
 
-`-ub 1024` is now the default. `-ub 2048` (`UBATCH=2048 EC_SLOTS=21`) doubles prompt speed again but generation gets ~10-15% slower.
+### Compute buffers
+
+Two compute buffer savings freed 366 MiB at the same settings (7.51 to 7.14 GB), with the same output (identical text over 256 greedy tokens after a 12k prompt):
+
+- **The drafter borrows the target's flash attention scratch.** The CUDA flash attention kernels for long batches need f16 K/V, so with the 8-bit KV cache each context reserves an f16 copy of the whole cache (256 MiB at 64k for Gemma's global layers). The drafter attends to the target's KV cache, so it reserved the same 256 MiB again. The two never run at the same time, so the drafter's attention ops are flagged (`ggml_flash_attn_ext_set_borrow_f16`) and use the target's compute buffer, which is idle while the drafter runs: the drafter's compute buffer went from 285 to 33 MiB.
+- **Graph inputs are copied to the GPU at the start of the graph.** The scheduler copied the global attention mask (128 MiB at `-ub 1024`) when the first global layer needed it, i.e. in the middle of the buffer, where it stayed for the rest of the graph and the 272 MiB expert upload of the next layers no longer fit below it. Copied at the start, it sits at the bottom: the target's compute buffer went from 616 to 502 MiB. gpt-oss and Qwen3-Coder are not affected (same VRAM, same output).
+
+The freed VRAM goes to 4 more slots:
+
+| Gemma 4, 64k context | slots | prompt tokens/s | chat tokens/s | code edit tokens/s | VRAM |
+|---|---|---|---|---|---|
+| `-ub 1024` (default) | 31 | **~770-855** | 58-65 | 71-76 | 7.48 GB |
+| `-ub 2048` | 27 | ~1170 | 60 | 73 | 7.57 GB |
+
+These were measured late in a long session (a warm laptop), so they read a few % lower than the table above; on the same runs, 27 slots gave chat 62-65, edit 68-73. `-ub 2048` (`UBATCH=2048 EC_SLOTS=27`) still makes generation slower, even with the same slots, so it is not memory that costs the speed there.
 
 ### What was measured to not matter
 
@@ -210,7 +226,9 @@ The remaining lever is the hit rate, i.e. more slots, i.e. more VRAM.
 | `src/llama-graph.{h,cpp}` | `build_moe_ffn` looks up the layer's cache; `build_moe_exps_split`: the split GPU/CPU expert computation; `build_moe_act`: the activation shared by both paths |
 | `src/llama-context.cpp` | passes the per-layer caches to the graph, updates the cache after each computed batch |
 | `ggml/src/ggml-cpu/ggml-cpu.c`, `ggml/src/ggml-cuda/mmvq.cu` | `MUL_MAT_ID` skips `-1` ids |
-| `ggml/src/ggml-backend.cpp`, `ggml/include/ggml-backend.h` | early copy (and the experimental prelaunch) in the scheduler; expert copy callback for large batches |
+| `ggml/src/ggml-backend.cpp`, `ggml/include/ggml-backend.h` | early copy (and the experimental prelaunch) in the scheduler; expert copy callback for large batches; graph inputs copied at the start of the graph |
+| `ggml/src/ggml-cuda/fattn.cu`, `fattn-common.cuh`, `ggml/src/ggml.c`, `ggml/include/ggml.h` | `ggml_flash_attn_ext_set_borrow_f16`: the drafter's flash attention uses the target's compute buffer for its f16 K/V copies |
+| `common/speculative.cpp` | `LLAMA_DRAFT_UBATCH`: the draft context's own ubatch |
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | host flag wait kernel for the prelaunch |
 | `scripts/expert-cache/` | serve scripts for Gemma 4, gpt-oss and Qwen3-Coder, download script, Gemma startup profile |
 

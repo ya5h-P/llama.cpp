@@ -2508,6 +2508,12 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // hint: the op may run its f16 K/V conversion in scratch memory lent by another context
+    // (e.g. an MTP drafter borrowing its target's compute buffer) instead of its own compute buffer
+    GGML_API void ggml_flash_attn_ext_set_borrow_f16(
+            struct ggml_tensor * a,
+            bool                 borrow);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

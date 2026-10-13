@@ -1438,6 +1438,42 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->n_splits = i_split + 1;
     }
 
+    // Copy graph inputs (masks, positions, ...) in the first split of each backend instead of the first
+    // split that uses them. ggml-alloc places a split's input copies when the split starts, so an input
+    // first used halfway through the graph (e.g. the global attention mask of an iSWA model, 128 MiB at
+    // -ub 1024 and 64k context) lands in the middle of the buffer and fragments it for every later split.
+    // Copied at the start, it sits at the bottom instead. GGML_SCHED_HOIST_INPUTS=0 disables this.
+    static const bool hoist_inputs = [] {
+        const char * env = getenv("GGML_SCHED_HOIST_INPUTS");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (hoist_inputs && sched->n_copies == 1) {
+        for (int i = 1; i < sched->n_splits; i++) {
+            struct ggml_backend_sched_split * split = &sched->splits[i];
+            int first = 0;
+            while (first < i && sched->splits[first].backend_id != split->backend_id) {
+                first++;
+            }
+            if (first == i) {
+                continue;
+            }
+            struct ggml_backend_sched_split * dst_split = &sched->splits[first];
+            int n_keep = 0;
+            for (int j = 0; j < split->n_inputs; j++) {
+                struct ggml_tensor * input = split->inputs[j];
+                if ((input->flags & GGML_TENSOR_FLAG_INPUT) && input->op == GGML_OP_NONE && input->view_src == NULL) {
+                    if (dst_split->n_inputs >= dst_split->inputs_capacity) {
+                        ggml_backend_sched_split_inputs_grow(dst_split);
+                    }
+                    dst_split->inputs[dst_split->n_inputs++] = input;
+                } else {
+                    split->inputs[n_keep++] = input;
+                }
+            }
+            split->n_inputs = n_keep;
+        }
+    }
+
     if (sched->debug) {
         ggml_backend_sched_print_assignments(sched, graph);
     }

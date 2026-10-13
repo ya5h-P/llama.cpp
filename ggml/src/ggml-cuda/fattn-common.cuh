@@ -50,8 +50,19 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t end;
 };
 
+// The f16 copies of a quantized K/V hold the whole KV cache (hundreds of MB at long contexts).
+// A context whose FLASH_ATTN_EXT ops have the borrow flag (an MTP drafter) does not reserve them in its
+// own compute buffer: it uses the compute buffer last lent by another context on the device (its target,
+// idle while the drafter runs), or a fallback buffer if nothing large enough was lent.
+// GGML_CUDA_FA_SHARED_F16=0 restores the per-graph allocation everywhere.
+bool   ggml_cuda_fattn_borrow_f16(const ggml_tensor * dst);
+void   ggml_cuda_fattn_shared_f16_reserve(int device, size_t size);
+void * ggml_cuda_fattn_shared_f16_get(int device, size_t size, cudaStream_t stream);
+void   ggml_cuda_fattn_shared_f16_lend(int device, const ggml_tensor * dst, cudaStream_t stream);
+
+// shared: return offsets into borrowed scratch memory instead of addresses after dst
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
-        const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
+        const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V, const bool shared) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
     const ggml_tensor * K = dst->src[1];
@@ -63,7 +74,8 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
     ggml_cuda_flash_attn_ext_f16_extra_data data = {};
-    data.end = (uintptr_t) dst->data + ggml_nbytes(dst);
+    // shared: offsets start at 128 so that 0 still means "no copy needed"
+    data.end = shared ? 128 : (uintptr_t) dst->data + ggml_nbytes(dst);
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         data.end = GGML_PAD(data.end, 128);
@@ -1006,8 +1018,18 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
-    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
+    const bool f16_borrow = ggml_cuda_fattn_borrow_f16(KQV);
+    ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V, f16_borrow);
+    if (f16_borrow) {
+        if (f16_extra.end > 128) {
+            const uintptr_t base = (uintptr_t) ggml_cuda_fattn_shared_f16_get(id, f16_extra.end, main_stream);
+            f16_extra.K = f16_extra.K ? base + f16_extra.K : 0;
+            f16_extra.V = f16_extra.V ? base + f16_extra.V : 0;
+        }
+    } else {
+        ggml_cuda_fattn_shared_f16_lend(id, KQV, main_stream);
+    }
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);

@@ -5,6 +5,10 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <algorithm>
+#include <cstdlib>
+#include <mutex>
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_mask_to_sparse_indices(
@@ -717,10 +721,89 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
     }
 
+    if (ggml_cuda_fattn_borrow_f16(dst)) {
+        const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+            ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V, true);
+        if (f16_extra.end > 128) {
+            ggml_cuda_fattn_shared_f16_reserve(device, f16_extra.end);
+        }
+        return ggml_nbytes(dst);
+    }
+
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V, false);
 
     return f16_extra.end - (uintptr_t) dst->data;
+}
+
+struct ggml_cuda_fattn_shared_f16 {
+    // compute buffer lent by a context that does not borrow (the target model)
+    void *       lent_ptr    = nullptr;
+    size_t       lent_size   = 0;
+    cudaStream_t lent_stream = nullptr;
+
+    // fallback when nothing large enough was lent
+    void *       own_ptr     = nullptr;
+    size_t       own_size    = 0;
+    size_t       needed      = 0; // largest size seen while reserving graphs
+
+    cudaStream_t borrower    = nullptr; // stream of the last borrower
+};
+
+static std::mutex                 g_fattn_shared_mutex;
+static ggml_cuda_fattn_shared_f16 g_fattn_shared[GGML_CUDA_MAX_DEVICES];
+
+bool ggml_cuda_fattn_borrow_f16(const ggml_tensor * dst) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_SHARED_F16");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled && ggml_get_op_params_i32(dst, 6) != 0;
+}
+
+void ggml_cuda_fattn_shared_f16_reserve(int device, size_t size) {
+    std::lock_guard<std::mutex> lock(g_fattn_shared_mutex);
+    ggml_cuda_fattn_shared_f16 & s = g_fattn_shared[device];
+    s.needed = std::max(s.needed, size);
+}
+
+void ggml_cuda_fattn_shared_f16_lend(int device, const ggml_tensor * dst, cudaStream_t stream) {
+    if (dst->buffer == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_fattn_shared_mutex);
+    ggml_cuda_fattn_shared_f16 & s = g_fattn_shared[device];
+    // the lender is about to write its compute buffer: a borrower on another stream must be done with it
+    if (s.borrower != nullptr && s.borrower != stream && s.lent_ptr != nullptr) {
+        CUDA_CHECK(cudaStreamSynchronize(s.borrower));
+        s.borrower = nullptr;
+    }
+    // the whole compute buffer is idle while the lender is not computing
+    s.lent_ptr    = ggml_backend_buffer_get_base(dst->buffer);
+    s.lent_size   = ggml_backend_buffer_get_size(dst->buffer);
+    s.lent_stream = stream;
+}
+
+void * ggml_cuda_fattn_shared_f16_get(int device, size_t size, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(g_fattn_shared_mutex);
+    ggml_cuda_fattn_shared_f16 & s = g_fattn_shared[device];
+    s.borrower = stream;
+    if (s.lent_ptr != nullptr && s.lent_size >= size && s.lent_stream != stream) {
+        // the lender's graph must be finished before its buffer is reused
+        CUDA_CHECK(cudaStreamSynchronize(s.lent_stream));
+        return s.lent_ptr;
+    }
+    if (size > s.own_size) {
+        // The old buffer is not freed: a captured CUDA graph may still point at it.
+        const size_t new_size = std::max(size, s.needed);
+        void * ptr = nullptr;
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaMalloc(&ptr, new_size));
+        GGML_LOG_INFO("%s: flash attention f16 K/V fallback buffer: %.2f MiB\n", __func__, new_size/1024.0/1024.0);
+        s.own_ptr  = ptr;
+        s.own_size = new_size;
+    }
+    return s.own_ptr;
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

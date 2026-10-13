@@ -5,7 +5,7 @@
 # Settings (env), defaults tuned on an RTX 4060 Laptop 8 GB + i7-13620H:
 #   CTX=65536     context size
 #   N_CPU_MOE=26  layers whose experts stay in system RAM (the other 4 are fully on the GPU)
-#   EC_SLOTS=27   GPU cache slots per CPU layer (0 = cache off, stock llama.cpp behavior)
+#   EC_SLOTS=31   GPU cache slots per CPU layer (0 = cache off, stock llama.cpp behavior)
 #   EC_BUDGET=4   experts copied to the GPU per token
 #   THREADS=10    CPU threads
 #   UBATCH=1024   prompt tokens per GPU pass: prompts are PCIe-bound, 1024 is ~1.5x faster than 512
@@ -27,7 +27,7 @@ if [[ "${MTP:-1}" == 1 ]]; then
         --spec-type draft-mtp --spec-draft-n-max "${DRAFT_N:-4}")
 fi
 
-export LLAMA_EXPERT_CACHE="${EC_SLOTS:-27}"
+export LLAMA_EXPERT_CACHE="${EC_SLOTS:-31}"
 export LLAMA_EXPERT_CACHE_BUDGET="${EC_BUDGET:-4}"
 export LLAMA_DRAFT_UBATCH="${DRAFT_UB:-128}"
 export LLAMA_EXPERT_CACHE_PROFILE="${EC_PROFILE:-$HERE/expert-profile.txt}"
