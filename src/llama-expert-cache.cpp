@@ -63,18 +63,44 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::init(llama_model & model
 
     for (int il = 0; il < (int) model.layers.size(); ++il) {
         auto & l = model.layers[il];
-        if (l.ffn_gate_up_exps == nullptr || l.ffn_down_exps == nullptr) {
-            continue;
-        }
-        if (!is_plain_host_buffer(l.ffn_gate_up_exps) || !is_plain_host_buffer(l.ffn_down_exps)) {
-            continue;
-        }
+        auto & c = l.exp_cache;
+
         layer cl;
-        cl.il          = il;
-        cl.gate_up_src = l.ffn_gate_up_exps;
-        cl.down_src    = l.ffn_down_exps;
-        cl.cache       = &l.exp_cache;
-        cl.down_s_src  = is_plain_host_buffer(l.ffn_down_exps_s) ? l.ffn_down_exps_s : nullptr;
+        cl.il    = il;
+        cl.cache = &c;
+        if (l.ffn_gate_up_exps) {
+            cl.exps = { { l.ffn_gate_up_exps, &c.gate_up, "gate_up" } };
+        } else if (l.ffn_gate_exps && l.ffn_up_exps) {
+            cl.exps = { { l.ffn_gate_exps, &c.gate, "gate" }, { l.ffn_up_exps, &c.up, "up" } };
+        } else {
+            continue;
+        }
+        if (l.ffn_down_exps == nullptr) {
+            continue;
+        }
+        cl.exps.push_back({ l.ffn_down_exps, &c.down, "down" });
+
+        bool ok = true;
+        for (const auto & t : cl.exps) {
+            ok = ok && is_plain_host_buffer(t.src) && t.src->ne[2] == cl.exps[0].src->ne[2];
+        }
+        if (!ok) {
+            continue;
+        }
+
+        // the GPU side needs its own copy of these, else they would be copied from host memory for each layer
+        const layer::tensor fixed[] = {
+            { l.ffn_down_exps_s,    &c.down_s,    "down_s"    },
+            { l.ffn_gate_up_exps_b, &c.gate_up_b, "gate_up_b" },
+            { l.ffn_gate_exps_b,    &c.gate_b,    "gate_b"    },
+            { l.ffn_up_exps_b,      &c.up_b,      "up_b"      },
+            { l.ffn_down_exps_b,    &c.down_b,    "down_b"    },
+        };
+        for (const auto & t : fixed) {
+            if (is_plain_host_buffer(t.src)) {
+                cl.fixed.push_back(t);
+            }
+        }
         ec->layers.push_back(cl);
     }
 
@@ -83,7 +109,7 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::init(llama_model & model
         return nullptr;
     }
 
-    ec->n_expert = (int) ec->layers[0].gate_up_src->ne[2];
+    ec->n_expert = (int) ec->layers[0].exps[0].src->ne[2];
     ec->n_slot   = std::min(n_slot, ec->n_expert);
     ec->n_used   = (int) model.hparams.n_expert_used(ec->layers[0].il);
 
@@ -95,7 +121,7 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::init(llama_model & model
     }
 
     ggml_init_params params = {
-        /*.mem_size   =*/ (ec->layers.size()*6 + 2)*ggml_tensor_overhead(),
+        /*.mem_size   =*/ (ec->layers.size()*12 + 2)*ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -111,24 +137,20 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::init(llama_model & model
 
     for (size_t li = 0; li < ec->layers.size(); ++li) {
         auto & cl = ec->layers[li];
-        const ggml_tensor * gu = cl.gate_up_src;
-        const ggml_tensor * dn = cl.down_src;
-        GGML_ASSERT(gu->ne[2] == ec->n_expert && dn->ne[2] == ec->n_expert);
-
-        auto & c = *cl.cache;
-        c.gate_up = ggml_new_tensor_3d(ec->ctx, gu->type, gu->ne[0], gu->ne[1], ec->n_slot);
-        c.down    = ggml_new_tensor_3d(ec->ctx, dn->type, dn->ne[0], dn->ne[1], ec->n_slot);
-        c.slot    = ggml_view_2d(ec->ctx, ec->tables, 1, ec->n_expert, sizeof(int32_t), li*ec->tables->nb[2]);
-        c.cpu_id  = ggml_view_2d(ec->ctx, ec->tables, 1, ec->n_expert, sizeof(int32_t), li*ec->tables->nb[2] + ec->tables->nb[1]);
-        ggml_format_name(c.gate_up, "blk.%d.ffn_gate_up_exps_cache", cl.il);
-        ggml_format_name(c.down,    "blk.%d.ffn_down_exps_cache",    cl.il);
-        ggml_format_name(c.slot,    "blk.%d.ffn_exps_cache_slot",    cl.il);
-        ggml_format_name(c.cpu_id,  "blk.%d.ffn_exps_cache_cpu_id",  cl.il);
-
-        if (cl.down_s_src) {
-            c.down_s = ggml_dup_tensor(ec->ctx, cl.down_s_src);
-            ggml_format_name(c.down_s, "blk.%d.ffn_down_exps_s_cache", cl.il);
+        auto & c  = *cl.cache;
+        for (const auto & t : cl.exps) {
+            GGML_ASSERT(t.src->ne[2] == ec->n_expert);
+            *t.dst = ggml_new_tensor_3d(ec->ctx, t.src->type, t.src->ne[0], t.src->ne[1], ec->n_slot);
+            ggml_format_name(*t.dst, "blk.%d.ffn_%s_exps_cache", cl.il, t.name);
         }
+        for (const auto & t : cl.fixed) {
+            *t.dst = ggml_dup_tensor(ec->ctx, t.src);
+            ggml_format_name(*t.dst, "blk.%d.ffn_%s_exps_cache", cl.il, t.name);
+        }
+        c.slot   = ggml_view_2d(ec->ctx, ec->tables, 1, ec->n_expert, sizeof(int32_t), li*ec->tables->nb[2]);
+        c.cpu_id = ggml_view_2d(ec->ctx, ec->tables, 1, ec->n_expert, sizeof(int32_t), li*ec->tables->nb[2] + ec->tables->nb[1]);
+        ggml_format_name(c.slot,   "blk.%d.ffn_exps_cache_slot",   cl.il);
+        ggml_format_name(c.cpu_id, "blk.%d.ffn_exps_cache_cpu_id", cl.il);
 
         c.ids = ggml_view_1d(ec->ctx, ec->ids, n_ids, li*ec->ids->nb[1]);
         ggml_format_name(c.ids, "blk.%d.ffn_exps_cache_ids", cl.il);
@@ -163,15 +185,16 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::init(llama_model & model
     if (pf != nullptr && atoi(pf) != 0) {
         const int64_t t0 = ggml_time_us();
         for (auto & cl : ec->layers) {
-            prefault(cl.gate_up_src);
-            prefault(cl.down_src);
+            for (const auto & t : cl.exps) {
+                prefault(t.src);
+            }
         }
         LLAMA_LOG_INFO("%s: prefaulted the host experts in %.1f s\n", __func__, (ggml_time_us() - t0)/1e6);
     }
 
     for (auto & cl : ec->layers) {
-        if (cl.down_s_src) {
-            ggml_backend_tensor_set(cl.cache->down_s, cl.down_s_src->data, 0, ggml_nbytes(cl.down_s_src));
+        for (const auto & t : cl.fixed) {
+            ggml_backend_tensor_set(*t.dst, t.src->data, 0, ggml_nbytes(t.src));
         }
         cl.slot     .assign(ec->n_expert, -1);
         cl.cpu_id   .resize(ec->n_expert);
@@ -202,6 +225,11 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::init(llama_model & model
             ec->publish(cl, s, order[s]);
         }
     }
+    ec->layer_caches.assign(model.layers.size(), nullptr);
+    for (const auto & cl : ec->layers) {
+        ec->layer_caches[cl.il] = cl.cache;
+    }
+
     ec->tables_host.resize(ggml_nelements(ec->tables));
     ec->upload_tables();
 
@@ -243,8 +271,9 @@ static void tensor_set_chunked(ggml_tensor * dst, const char * src, size_t offse
 }
 
 void llama_expert_cache::copy_expert(const layer & l, int s, int e) {
-    tensor_set_chunked(l.cache->gate_up, (const char *) l.gate_up_src->data + e*l.gate_up_src->nb[2], s*l.cache->gate_up->nb[2], l.gate_up_src->nb[2], chunk);
-    tensor_set_chunked(l.cache->down,    (const char *) l.down_src->data    + e*l.down_src->nb[2],    s*l.cache->down->nb[2],    l.down_src->nb[2],    chunk);
+    for (const auto & t : l.exps) {
+        tensor_set_chunked(*t.dst, (const char *) t.src->data + e*t.src->nb[2], s*(*t.dst)->nb[2], t.src->nb[2], chunk);
+    }
 }
 
 void llama_expert_cache::upload_tables() {

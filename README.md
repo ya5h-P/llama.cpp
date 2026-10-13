@@ -2,16 +2,18 @@
 
 A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) (build b11046) that runs large Mixture-of-Experts models faster on small GPUs. It keeps the most used experts in a GPU cache, so that most of the expert math runs on the GPU even though the experts do not fit in VRAM.
 
-It was built and tuned for **Gemma 4 26B-A4B on an 8 GB laptop GPU**:
+It works with any MoE model built through llama.cpp's shared `build_moe_ffn` (see [Limitations](#limitations)), and was tuned on an 8 GB laptop GPU (RTX 4060 Laptop, i7-13620H, 64k context):
 
-| RTX 4060 Laptop 8 GB, i7-13620H, 64k context, MTP speculative decoding | tokens/s | VRAM |
+| model | stock llama.cpp, best `--n-cpu-moe` | this fork, expert cache |
 |---|---|---|
-| stock llama.cpp, best `--n-cpu-moe` | ~31 | 7.1 GB |
-| this fork, expert cache | **~62-69** | 7.5 GB |
+| Gemma 4 26B-A4B (UD-Q4_K_XL, MTP speculative decoding) | ~31 tokens/s | **~62-69 tokens/s** |
+| gpt-oss-20b (Q4_K_M, no speculative decoding) | ~45 tokens/s | **~55-58 tokens/s** |
+
+Both runs use ~7.3-7.5 GB of VRAM. The gain is largest when many small experts are reused often (Gemma: 128 experts of 3.35 MB) and smaller with a few large ones (gpt-oss: 32 experts of 13 MB).
 
 The output is the same model computation: every expert is still computed exactly once, on the GPU or on the CPU. Greedy outputs only differ from stock llama.cpp at near-ties, the same way stock llama.cpp differs between two `--n-cpu-moe` settings.
 
-This is a personal experiment, not an upstream feature. Only Gemma 4 is wired up, and it was only tested on one machine.
+This is a personal experiment, not an upstream feature, tested on one machine.
 
 ## Quick start
 
@@ -89,7 +91,9 @@ So each CPU layer gets `n` GPU slots holding copies of its hottest experts. For 
 1. The router picks 8 experts per layer, as usual.
 2. Two small lookup tables map each expert to its GPU slot, or to its CPU id. Experts not in the cache get slot `-1` on the GPU side, and cached experts get id `-1` on the CPU side.
 3. The GPU computes the cached experts from the slots, and the CPU computes the rest from RAM. `MUL_MAT_ID` was changed to skip `-1` ids (zero output rows), so each expert is computed by exactly one side.
-4. The two partial results are added, and the expert weights and scales are applied as usual.
+4. The two partial results are added, and the down bias, the expert weights and the scales are applied as usual.
+
+Models with separate gate and up tensors run three `MUL_MAT_ID` per side instead of two. Per-expert gate/up biases (gpt-oss) are added on each side with the real expert ids: the rows of the other side's experts then hold only a bias, and the down `MUL_MAT_ID` turns them back into zero rows. Both sides share the stock activation code, so every activation llama.cpp supports for MoE works.
 
 ```
             router -> 8 expert ids
@@ -134,9 +138,8 @@ The remaining lever is the hit rate, i.e. more slots, i.e. more VRAM.
 | file | change |
 |---|---|
 | `src/llama-expert-cache.{h,cpp}` | the cache: slots, lookup tables, scores, background copies |
-| `src/llama-graph.{h,cpp}` | `build_moe_exps_split`: the split GPU/CPU expert computation |
-| `src/models/gemma4.cpp` | passes the cache of each layer to `build_moe_ffn` |
-| `src/llama-context.cpp` | updates the cache after each computed batch |
+| `src/llama-graph.{h,cpp}` | `build_moe_ffn` looks up the layer's cache; `build_moe_exps_split`: the split GPU/CPU expert computation; `build_moe_act`: the activation shared by both paths |
+| `src/llama-context.cpp` | passes the per-layer caches to the graph, updates the cache after each computed batch |
 | `ggml/src/ggml-cpu/ggml-cpu.c`, `ggml/src/ggml-cuda/mmvq.cu` | `MUL_MAT_ID` skips `-1` ids |
 | `ggml/src/ggml-backend.cpp` | early copy (and the experimental prelaunch) in the scheduler |
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | host flag wait kernel for the prelaunch |
@@ -144,7 +147,8 @@ The remaining lever is the hit rate, i.e. more slots, i.e. more VRAM.
 
 ## Limitations
 
-- Only Gemma 4 is wired up. Another MoE model needs its `build_moe_ffn` call to pass `&model.layers[il].exp_cache` (see `src/models/gemma4.cpp`), and needs merged gate/up expert tensors, no expert biases, and a GELU or SiLU activation.
+- The model has to build its experts with `build_moe_ffn` (nearly all MoE models in llama.cpp do), with a gated FFN (merged `gate_up` or separate `gate` and `up` tensors). Layers with per-expert gate/up scales, weights applied before the FFN, or LoRA adapters fall back to the normal path. Tested on Gemma 4 26B-A4B and gpt-oss-20b.
+- The startup profile in `scripts/expert-cache/` is for Gemma 4. Other models start without one (unset `LLAMA_EXPERT_CACHE_PROFILE`) and learn their hot experts as they run.
 - The cache is only used for batches of up to 8 tokens (generation and MTP verification). Prompt processing uses the normal path.
 - CUDA only, and only tested on Linux with one GPU.
 - Expert layers stored in repacked CPU formats are not cached.

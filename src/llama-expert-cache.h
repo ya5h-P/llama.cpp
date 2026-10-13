@@ -29,13 +29,20 @@ struct llama_expert_cache {
     // call after the graph is computed and the backends are synchronized
     void update(int n_tokens);
 
+    // [n_layer] cache of each layer, nullptr for layers that are not cached; build_moe_ffn looks the layer up here
+    std::vector<const llm_moe_expert_cache *> layer_caches;
+
 private:
     struct layer {
         int il;
 
-        ggml_tensor * gate_up_src; // host
-        ggml_tensor * down_src;    // host
-        ggml_tensor * down_s_src;  // host, optional
+        struct tensor {
+            ggml_tensor *  src;  // host
+            ggml_tensor ** dst;  // field of llm_moe_expert_cache
+            const char *   name;
+        };
+        std::vector<tensor> exps;  // expert weights (gate_up or gate+up, and down): copied per slot
+        std::vector<tensor> fixed; // small per-expert tensors (biases, scales): copied once, in full
 
         llm_moe_expert_cache * cache;
 

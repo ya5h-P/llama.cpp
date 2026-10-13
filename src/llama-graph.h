@@ -81,12 +81,20 @@ enum llm_norm_type {
 // GPU copy of a subset of the experts of one MoE layer whose expert weights stay in host memory
 // see llama-expert-cache.h
 struct llm_moe_expert_cache {
-    ggml_tensor * gate_up = nullptr; // [n_embd, n_ff*2, n_slot]
+    ggml_tensor * gate_up = nullptr; // [n_embd, n_ff*2, n_slot], models with merged gate/up experts
+    ggml_tensor * gate    = nullptr; // [n_embd, n_ff, n_slot], models with separate gate/up experts
+    ggml_tensor * up      = nullptr; // [n_embd, n_ff, n_slot]
     ggml_tensor * down    = nullptr; // [n_ff, n_embd, n_slot]
     ggml_tensor * slot    = nullptr; // [1, n_expert] I32: slot of the expert, -1 if not cached
     ggml_tensor * cpu_id  = nullptr; // [1, n_expert] I32: -1 if cached, else the expert id
     ggml_tensor * ids     = nullptr; // [n_expert_used*LLAMA_EXPERT_CACHE_MAX_TOKENS] I32: selected experts of the last batch
     ggml_tensor * down_s  = nullptr; // GPU copy of ffn_down_exps_s, if any, so that no layer input comes from pageable memory
+
+    // GPU copies of the per-expert biases, if any (indexed by expert id, not slot)
+    ggml_tensor * gate_up_b = nullptr;
+    ggml_tensor * gate_b    = nullptr;
+    ggml_tensor * up_b      = nullptr;
+    ggml_tensor * down_b    = nullptr;
 };
 
 // TODO: tmp - need something better to pass the data from the encoder to the decoder
@@ -824,6 +832,9 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // per-layer GPU expert caches (see llama-expert-cache.h), nullptr or empty if none
+    const std::vector<const llm_moe_expert_cache *> * exp_caches = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -1043,6 +1054,8 @@ struct llm_graph_context {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    const std::vector<const llm_moe_expert_cache *> * exp_caches;
+
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
@@ -1173,11 +1186,25 @@ struct llm_graph_context {
              ggml_tensor * selected_experts_in = nullptr,
              const llm_moe_expert_cache * exp_cache = nullptr) const;
 
+    ggml_tensor * build_moe_act(
+             ggml_tensor * cur,
+             ggml_tensor * up,
+                    bool   has_gate_exps,
+                    bool   has_gate,
+         llm_ffn_op_type   type_op,
+                     int   il) const;
+
     // experts of the cached slots run on the GPU, the rest on the CPU; returns [n_embd, n_expert_used, n_tokens]
     ggml_tensor * build_moe_exps_split(
              ggml_tensor * cur,
              ggml_tensor * gate_up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * up_exps,
              ggml_tensor * down_exps,
+             ggml_tensor * gate_up_exps_b,
+             ggml_tensor * gate_exps_b,
+             ggml_tensor * up_exps_b,
+             ggml_tensor * down_exps_b,
              ggml_tensor * down_exps_s,
              ggml_tensor * selected_experts,
              ggml_tensor * selected_experts_cont,
