@@ -59,7 +59,7 @@ The scripts read these environment variables, e.g. `CTX=32768 EC_SLOTS=24 script
 | `EC_SLOTS` | 31 of 128 | 14 of 32 | 26 of 128 | GPU cache slots per CPU layer (of the layer's experts), `0` turns the cache off |
 | `EC_BUDGET` | 4 | 2 | 8 | experts copied to the GPU per token |
 | `THREADS` | 10 | 10 | 10 | CPU threads |
-| `UBATCH` | 1024 | | | prompt tokens per GPU pass (`-ub`), see [Prompt processing](#prompt-processing) |
+| `UBATCH` | 1024 | 1024 | 512 | prompt tokens per GPU pass (`-ub`), see [Prompt processing](#prompt-processing) |
 | `MTP` / `DRAFT_N` / `DRAFT_UB` | 1 / 4 / 128 | | | MTP speculative decoding on/off, draft length, and the drafter's own ubatch |
 | `NGRAM` | | 1 | 1 | n-gram speculative decoding on/off |
 | `MODEL_DIR` | `models/` | `models/` | `models/` | where the GGUF files are |
@@ -208,6 +208,21 @@ The freed VRAM goes to 4 more slots:
 | `-ub 2048` | 27 | ~1170 | 60 | 73 | 7.57 GB |
 
 These were measured late in a long session (a warm laptop), so they read a few % lower than the table above; on the same runs, 27 slots gave chat 62-65, edit 68-73. `-ub 2048` (`UBATCH=2048 EC_SLOTS=27`) still makes generation slower, even with the same slots, so it is not memory that costs the speed there.
+
+### `-ub` on gpt-oss and Qwen3-Coder
+
+Neither has a drafter, so the drafter savings above do not apply to them; the trade is only prompt speed against slots. On a ~11k token prompt, 64k context:
+
+| model | `-ub` | slots | prompt tokens/s | chat tokens/s | code edit tokens/s | VRAM |
+|---|---|---|---|---|---|---|
+| gpt-oss-20b | 512 | 14 | ~840 | 59 | 86 | 7.33 GB |
+| gpt-oss-20b | **1024 (default)** | 14 | **~1210** | 58 | 83 | 7.48 GB |
+| gpt-oss-20b | 2048 | 13 | ~1415 | 54 | 75 | 7.48 GB |
+| Qwen3-Coder | **512 (default)** | 26 | ~463 | 51 | 61 | 7.50 GB |
+| Qwen3-Coder | 1024 | 24 | ~700 | 46 | 54 | 7.45 GB |
+| Qwen3-Coder | 2048 | 22 | ~877 | 43 | 49 | 7.54 GB |
+
+gpt-oss fits `-ub 1024` without losing a slot (+45% prompt speed for free). Qwen3-Coder has full attention in every layer, so its compute buffer grows more, and it costs 2 slots and ~10% of generation speed: it stays at 512 (`UBATCH=1024 EC_SLOTS=24` for long one-off prompts). In an agent like opencode the long prompt is cached after the first request, so generation speed matters on every turn.
 
 ### What was measured to not matter
 

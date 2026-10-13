@@ -8,6 +8,8 @@
 #   EC_SLOTS=26   GPU cache slots per CPU layer, of 128 experts (0 = cache off)
 #   EC_BUDGET=8   experts copied to the GPU per token (the experts are 2 MB, copies are cheap)
 #   THREADS=10    CPU threads
+#   UBATCH=512    prompt batch size. 1024 makes prompts ~1.5x faster but needs 2 slots less (EC_SLOTS=24),
+#                 which makes generation ~10% slower: UBATCH=1024 EC_SLOTS=24 for long one-off prompts
 #   NGRAM=1       n-gram speculative decoding: drafts by copying from the context, 38 -> 58 tokens/s on
 #                 code edits, ~5% slower on new text (0 = off). Drafts are capped at 7 so the cache stays in use.
 #   MODEL_DIR     where the GGUF file is (default: models/ in this repo)
@@ -35,7 +37,7 @@ exec "$BIN" \
   --alias qwen3-coder-30b-a3b \
   --host "${HOST:-127.0.0.1}" --port "${PORT:-8080}" \
   -ngl 99 --n-cpu-moe "${N_CPU_MOE:-46}" \
-  -c "${CTX:-65536}" -fa on -ctk q8_0 -ctv q8_0 \
+  -c "${CTX:-65536}" -fa on -ctk q8_0 -ctv q8_0 -ub "${UBATCH:-512}" \
   -t "${THREADS:-10}" -tb "${THREADS:-10}" -np 1 \
   --jinja \
   ${EXTRA:-}
