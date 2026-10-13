@@ -11,6 +11,7 @@
 #   MTP=1         MTP speculative decoding (0 = off), DRAFT_N=4 draft tokens
 #   MODEL_DIR     where the GGUF files are (default: models/ in this repo)
 #   EXTRA         extra llama-server arguments
+# Measured at 64k: stock llama.cpp ~38-44 tokens/s with the same flags (~31 with its default flags), this ~60-69 (7.5 GB VRAM).
 # Keep VRAM under ~7.5 GB: above that the first request can stall. With less VRAM, lower EC_SLOTS or raise N_CPU_MOE.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"

@@ -4,13 +4,13 @@ A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) (build b11046) that
 
 It works with any MoE model built through llama.cpp's shared `build_moe_ffn` (see [Limitations](#limitations)), and was tuned on an 8 GB laptop GPU (RTX 4060 Laptop, i7-13620H, 64k context):
 
-| model | stock llama.cpp, best `--n-cpu-moe` | this fork, expert cache |
-|---|---|---|
-| Gemma 4 26B-A4B (UD-Q4_K_XL, MTP speculative decoding) | ~31 tokens/s | **~62-69 tokens/s** |
-| gpt-oss-20b (Q4_K_M, no speculative decoding) | ~45 tokens/s | **~55-58 tokens/s** |
-| Qwen3-Coder-30B-A3B (UD-Q3_K_XL, no speculative decoding) | ~30 tokens/s | **~48 tokens/s** |
+| model | stock llama.cpp, best `--n-cpu-moe` | this fork, expert cache | speedup |
+|---|---|---|---|
+| Gemma 4 26B-A4B (UD-Q4_K_XL, MTP speculative decoding) | ~38-44 tokens/s | **~60-69 tokens/s** | ~1.5x |
+| gpt-oss-20b (Q4_K_M, no speculative decoding) | ~45 tokens/s | **~55-58 tokens/s** | ~1.25x |
+| Qwen3-Coder-30B-A3B (UD-Q3_K_XL, no speculative decoding) | ~30 tokens/s | **~48 tokens/s** | ~1.6x |
 
-All runs use ~7.3-7.5 GB of VRAM. The gain is largest when many small experts are reused often (Gemma: 128 experts of 3.35 MB per layer) and smaller with a few large ones (gpt-oss: 32 experts of 13 MB). gpt-oss and Qwen3-Coder have no MTP drafter, but n-gram speculative decoding (see [Speculative decoding](#speculative-decoding)) brings their code edits to ~81 and ~58 tokens/s.
+Both sides use the same flags (`-t 10 -tb 10 -np 1`, 64k context) and stay under ~7.5 GB of VRAM; with llama.cpp's default flags, stock Gemma gets ~31 tokens/s. The gain is largest when stock has to leave most layers on the CPU and the experts are small (Qwen3-Coder: 37 of 48 layers on the CPU, 2 MB experts), and smallest with a few large experts (gpt-oss: 32 experts of 13 MB, and 11 of 24 layers already fit on the GPU with stock). gpt-oss and Qwen3-Coder have no MTP drafter, but n-gram speculative decoding (see [Speculative decoding](#speculative-decoding)) brings their code edits to ~81 and ~58 tokens/s.
 
 The output is the same model computation: every expert is still computed exactly once, on the GPU or on the CPU. Greedy outputs only differ from stock llama.cpp at near-ties, the same way stock llama.cpp differs between two `--n-cpu-moe` settings.
 
