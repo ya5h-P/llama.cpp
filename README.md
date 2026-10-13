@@ -21,7 +21,7 @@ This is a personal experiment, not an upstream feature, tested on one machine.
 Requirements: Linux, an NVIDIA GPU with 8 GB or more and the CUDA toolkit, ~16 GB of RAM, and 12-15 GB of disk per model.
 
 ```sh
-git clone -b expert-cache-generic https://github.com/ya5h-P/llama.cpp.git
+git clone -b expert-cache https://github.com/ya5h-P/llama.cpp.git
 cd llama.cpp
 
 # build (native = the GPU in this machine)
@@ -38,8 +38,6 @@ scripts/expert-cache/serve-gpt-oss-20b.sh
 scripts/expert-cache/download-models.sh qwen3-coder   # 13.8 GB
 scripts/expert-cache/serve-qwen3-coder-30b.sh
 ```
-
-The `expert-cache` branch is the first version, which only supports Gemma 4. `expert-cache-generic` works with other MoE models and has all three scripts.
 
 The server has an OpenAI-compatible API on `http://127.0.0.1:8080/v1` and a web UI on `http://127.0.0.1:8080`. The model names are `gemma-4-26b-a4b-qat`, `gpt-oss-20b` and `qwen3-coder-30b-a3b`:
 
