@@ -708,9 +708,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            need_f16_K = !ggml_cuda_fattn_mma_kv_q8(dst);
+            need_f16_V = need_f16_K;
             break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
@@ -752,6 +755,31 @@ struct ggml_cuda_fattn_shared_f16 {
 
 static std::mutex                 g_fattn_shared_mutex;
 static ggml_cuda_fattn_shared_f16 g_fattn_shared[GGML_CUDA_MAX_DEVICES];
+
+bool ggml_cuda_fattn_mma_kv_q8(const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dst);
+    return false;
+#else
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_Q8");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    // only for small batches (decode, MTP verify, drafter): with large prompt batches every Q tile dequantizes
+    // the whole cache again, there one conversion to f16 is ~3% faster.
+    return enabled && Q->ne[0] == 512 && V->ne[0] == 512 && Q->ne[1] <= 32 &&
+        K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+        logit_softcap == 0.0f && ggml_get_op_params_i32(dst, 4) == 0 &&
+        K->nb[1] % 4 == 0 && V->nb[1] % 4 == 0;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
 
 bool ggml_cuda_fattn_borrow_f16(const ggml_tensor * dst) {
     static const bool enabled = [] {

@@ -81,6 +81,7 @@ The cache itself is controlled by environment variables read by `libllama`, so i
 | `LLAMA_EXPERT_CACHE_PP=0` | prompt processing copies all experts from host memory, also the cached ones |
 | `LLAMA_DRAFT_UBATCH=n` | ubatch of the draft context (default: the same as `-ub`) |
 | `GGML_CUDA_FA_SHARED_F16=0` | the drafter keeps its own flash attention scratch instead of borrowing the target's compute buffer (see below) |
+| `GGML_CUDA_FA_Q8=0` | convert the 8-bit KV cache to f16 before every flash attention again, instead of reading it in the kernel (see below) |
 | `GGML_SCHED_HOIST_INPUTS=0` | copy graph inputs to the GPU where they are first used, not at the start of the graph (see below) |
 | `GGML_SCHED_NO_EARLY_COPY=1` | disable the CPU/GPU overlap described below |
 | `GGML_SCHED_PRELAUNCH=1` | experimental, queue GPU work behind a host flag (no measured gain) |
@@ -209,6 +210,22 @@ The freed VRAM goes to 4 more slots:
 
 These were measured late in a long session (a warm laptop), so they read a few % lower than the table above; on the same runs, 27 slots gave chat 62-65, edit 68-73. `-ub 2048` (`UBATCH=2048 EC_SLOTS=27`) still makes generation slower, even with the same slots, so it is not memory that costs the speed there.
 
+### Attention on the 8-bit KV cache
+
+The CUDA tensor core flash attention kernel only reads f16 K/V, so with `-ctk q8_0 -ctv q8_0` every attention op first converted the whole used cache to f16 and wrote it out, then read the copy back. For Gemma's 5 global layers (head size 512) that is the full context on every decode step, MTP verify and drafter step, and it grows with the context: 11% of the GPU time at 12k tokens.
+
+For head size 512 and batches of up to 32 tokens (decode, MTP verify, the drafter), the kernel now reads the q8_0 blocks itself and dequantizes them while loading a tile into shared memory, with the same math as the conversion kernel. It reads half the bytes and writes nothing extra, so the attention kernels themselves also got faster (133 to 95 ms per 256 tokens at 12k, besides the 131 ms of conversions that are gone). The output is bit-identical (same text and logprobs over 256 greedy tokens after a 12k prompt).
+
+| Gemma 4, ~57k token prompt | 1st 256 tokens | 2nd 256 tokens | prompt tokens/s |
+|---|---|---|---|
+| f16 conversion (`GGML_CUDA_FA_Q8=0`) | 37-47 | 47-54 | ~720 |
+| q8_0 read in the kernel | 52-62 | 66-68 | ~725 |
+
+At 12k tokens the gain (~4% of the step) is below the run-to-run noise of a warm laptop. Not used for:
+
+- prompt batches: every Q tile dequantizes the whole cache again, there one conversion is ~3% faster;
+- head size 256 (the sliding window layers, a fixed 2k cache): the kernel loads those through an asynchronous `cp.async` pipeline that synchronous q8_0 loads lose, and it measured slower than converting.
+
 ### `-ub` on gpt-oss and Qwen3-Coder
 
 Neither has a drafter, so the drafter savings above do not apply to them; the trade is only prompt speed against slots. On a ~11k token prompt, 64k context:
@@ -243,6 +260,7 @@ The remaining lever is the hit rate, i.e. more slots, i.e. more VRAM.
 | `ggml/src/ggml-cpu/ggml-cpu.c`, `ggml/src/ggml-cuda/mmvq.cu` | `MUL_MAT_ID` skips `-1` ids |
 | `ggml/src/ggml-backend.cpp`, `ggml/include/ggml-backend.h` | early copy (and the experimental prelaunch) in the scheduler; expert copy callback for large batches; graph inputs copied at the start of the graph |
 | `ggml/src/ggml-cuda/fattn.cu`, `fattn-common.cuh`, `ggml/src/ggml.c`, `ggml/include/ggml.h` | `ggml_flash_attn_ext_set_borrow_f16`: the drafter's flash attention uses the target's compute buffer for its f16 K/V copies |
+| `ggml/src/ggml-cuda/fattn-mma-f16.cuh`, `fattn.cu`, `tests/test-backend-ops.cpp` | `KV_q8`: the MMA flash attention kernel reads q8_0 K/V directly for head size 512 |
 | `common/speculative.cpp` | `LLAMA_DRAFT_UBATCH`: the draft context's own ubatch |
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | host flag wait kernel for the prelaunch |
 | `scripts/expert-cache/` | serve scripts for Gemma 4, gpt-oss and Qwen3-Coder, download script, Gemma startup profile |

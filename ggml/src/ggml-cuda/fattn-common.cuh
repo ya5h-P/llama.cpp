@@ -56,6 +56,8 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
 // idle while the drafter runs), or a fallback buffer if nothing large enough was lent.
 // GGML_CUDA_FA_SHARED_F16=0 restores the per-graph allocation everywhere.
 bool   ggml_cuda_fattn_borrow_f16(const ggml_tensor * dst);
+// the MMA kernel reads q8_0 K/V directly (D == 512, batches <= 32), no f16 conversion needed
+bool   ggml_cuda_fattn_mma_kv_q8(const ggml_tensor * dst);
 void   ggml_cuda_fattn_shared_f16_reserve(int device, size_t size);
 void * ggml_cuda_fattn_shared_f16_get(int device, size_t size, cudaStream_t stream);
 void   ggml_cuda_fattn_shared_f16_lend(int device, const ggml_tensor * dst, cudaStream_t stream);
